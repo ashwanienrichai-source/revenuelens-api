@@ -1,0 +1,190 @@
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --brand: #1A3CF5;
+  --brand-light: #3D5EFF;
+  --ink-900: #1E2330;
+  --ink-600: #4D5870;
+  --ink-300: #AEB6C5;
+  --ink-50: #F6F7F9;
+  --surface: #FFFFFF;
+  --border: #E4E7ED;
+  --radius: 10px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  color: var(--ink-900);
+  background: #FFFFFF;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Syne', sans-serif;
+}
+
+/* ── Utility classes ── */
+.font-display { font-family: 'Syne', sans-serif; }
+.font-body    { font-family: 'DM Sans', sans-serif; }
+.font-mono    { font-family: 'DM Mono', monospace; }
+
+/* ── Card system ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.card-hover {
+  transition: box-shadow 0.2s ease, transform 0.2s ease;
+}
+.card-hover:hover {
+  box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+  transform: translateY(-2px);
+}
+
+/* ── Button system ── */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 22px;
+  background: var(--brand);
+  color: #FFFFFF;
+  border: none;
+  border-radius: 8px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+  text-decoration: none;
+}
+.btn-primary:hover {
+  background: #1530D4;
+  box-shadow: 0 4px 14px rgba(26,60,245,0.3);
+}
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 22px;
+  background: transparent;
+  color: var(--brand);
+  border: 1.5px solid #C5CFFF;
+  border-radius: 8px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-decoration: none;
+}
+.btn-secondary:hover {
+  background: #EEF3FF;
+  border-color: var(--brand);
+}
+
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  background: transparent;
+  color: var(--ink-600);
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-decoration: none;
+}
+.btn-ghost:hover {
+  background: var(--ink-50);
+  color: var(--ink-900);
+}
+
+/* ── Input system ── */
+.input-field {
+  width: 100%;
+  padding: 10px 14px;
+  background: #FAFBFE;
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 14px;
+  color: var(--ink-900);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+.input-field:focus {
+  border-color: var(--brand);
+  background: #FFFFFF;
+  box-shadow: 0 0 0 3px rgba(26,60,245,0.08);
+}
+.input-field::placeholder {
+  color: var(--ink-300);
+}
+
+/* ── Badge system ── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.badge-blue  { background: #EEF3FF; color: #1A3CF5; border: 1px solid #C5CFFF; }
+.badge-green { background: #ECFDF5; color: #059669; border: 1px solid #A7F3D0; }
+.badge-amber { background: #FFFBEB; color: #D97706; border: 1px solid #FDE68A; }
+.badge-red   { background: #FEF2F2; color: #DC2626; border: 1px solid #FCA5A5; }
+
+/* ── Section system ── */
+.section-label {
+  display: inline-block;
+  padding: 5px 13px;
+  background: #EEF3FF;
+  color: #1A3CF5;
+  border: 1px solid #C5CFFF;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 16px;
+}
+
+/* ── Animations ── */
+.animate-delay-100 { animation-delay: 100ms; }
+.animate-delay-200 { animation-delay: 200ms; }
+.animate-delay-300 { animation-delay: 300ms; }
+.animate-delay-400 { animation-delay: 400ms; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #D4D8E2; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #AEB6C5; }
+
+/* ── Prose ── */
+.prose-brand a { color: var(--brand); text-decoration: none; }
+.prose-brand a:hover { text-decoration: underline; }

@@ -364,7 +364,7 @@ export default function CohortPage() {
                         </button>
                       </div>
                     ))}
-                    <button onClick={()=>setHierarchies(prev=>[...prev,[''']])} className="text-xs text-brand-600 font-600 flex items-center gap-1">
+                    <button onClick={()=>setHierarchies(prev=>[...prev,['']])} className="text-xs text-brand-600 font-600 flex items-center gap-1">
                       <Plus size={12}/> Add hierarchy
                     </button>
                   </div>

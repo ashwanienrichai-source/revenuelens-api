@@ -16,6 +16,7 @@ from services.mrr_bridge_service import (
     get_top_customers, get_kpi_matrix, compute_mrr_bridge_from_raw
 )
 from services.bridge_pivot_service import build_full_bridge_response
+from services.mrr_workflow_engine import run_mrr_workflow
 
 app = FastAPI(title="RevenueLens API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
@@ -183,9 +184,13 @@ async def cohort_analyze(
 @app.post('/api/mrr/analyze')
 async def analyze_mrr_raw(
     file:           UploadFile = File(...),
-    customer_col:   str = Form('Customer_ID'),
-    date_col:       str = Form('Date'),
+    customer_col:   str = Form('CustomerID'),
+    date_col:       str = Form('Period'),
     revenue_col:    str = Form('Revenue'),
+    product_col:    str = Form('Product'),
+    channel_col:    str = Form('Channel'),
+    region_col:     str = Form(''),
+    quantity_col:   str = Form(''),
     revenue_unit:   str = Form('raw'),
     lookbacks:      str = Form('[1,3,12]'),
     dimension_cols: str = Form('[]'),
@@ -195,58 +200,84 @@ async def analyze_mrr_raw(
     n_customers:    int = Form(10),
     tool_type:      str = Form('MRR'),
 ):
-    """Handle raw MRR data — computes bridge classifications internally."""
+    """
+    Run the full MRR Workflow engine on raw data.
+    Exact Python replication of MRR_Workflow_Advanced.yxmd.
+    Produces bridge output identical to Alteryx CSV, then runs all analytics.
+    """
     df_raw = load_df(file)
     df_raw.columns = df_raw.columns.str.strip()
 
     lbs  = json.loads(lookbacks)
     dims = [d for d in json.loads(dimension_cols) if d in df_raw.columns]
 
-    # Case-insensitive column matching
-    col_map = {c.lower(): c for c in df_raw.columns}
-    for target, val in [('customer_col', customer_col), ('date_col', date_col), ('revenue_col', revenue_col)]:
-        actual = col_map.get(val.lower())
-        if actual and actual != val:
-            df_raw = df_raw.rename(columns={actual: val})
-        elif val not in df_raw.columns:
-            # Try partial match
-            match = next((c for c in df_raw.columns if val.lower() in c.lower() or c.lower() in val.lower()), None)
-            if match:
-                df_raw = df_raw.rename(columns={match: val})
-            else:
-                raise HTTPException(400, f"Column '{val}' not found. Available columns: {list(df_raw.columns)}")
+    # Case-insensitive column matching for required columns
+    col_lower = {c.lower().replace(' ','_'): c for c in df_raw.columns}
+    def find_col(target, fallbacks=[]):
+        candidates = [target] + fallbacks
+        for c in candidates:
+            if c in df_raw.columns: return c
+            norm = c.lower().replace(' ','_')
+            if norm in col_lower: return col_lower[norm]
+        return None
+
+    customer_col = find_col(customer_col, ['customer','customer_id','client','account']) or customer_col
+    date_col     = find_col(date_col,     ['date','period','month','activity_date'])      or date_col
+    revenue_col  = find_col(revenue_col,  ['revenue','mrr','arr','amount','value'])       or revenue_col
+    product_col  = find_col(product_col,  ['product','sku'])                              or product_col
+
+    for col in [customer_col, date_col, revenue_col]:
+        if col not in df_raw.columns:
+            raise HTTPException(400, f"Column '{col}' not found. Available: {list(df_raw.columns)}")
 
     try:
-        df_bridge = compute_mrr_bridge_from_raw(
-            df=df_raw,
-            customer_col=customer_col,
-            date_col=date_col,
-            revenue_col=revenue_col,
-            dimension_cols=dims,
-            lookback_months=lbs,
-            revenue_unit=revenue_unit,
+        # Run the Alteryx workflow equivalent
+        df_bridge = run_mrr_workflow(
+            df_raw        = df_raw,
+            customer_col  = customer_col,
+            date_col      = date_col,
+            revenue_col   = revenue_col,
+            product_col   = product_col if product_col in df_raw.columns else None,
+            channel_col   = channel_col if channel_col in df_raw.columns else None,
+            region_col    = region_col  if region_col  in df_raw.columns else None,
+            quantity_col  = quantity_col if quantity_col in df_raw.columns else None,
+            lookback_months = lbs,
+            revenue_unit  = revenue_unit,
         )
     except Exception as e:
-        raise HTTPException(500, f'Bridge computation failed: {str(e)}')
+        raise HTTPException(500, f'MRR workflow failed: {str(e)}')
 
     if df_bridge.empty:
-        raise HTTPException(400, 'No data after bridge computation. Check date and revenue columns.')
+        raise HTTPException(400, 'No output after MRR workflow. Check date and revenue columns.')
 
-    df_filtered = filter_bridge_df(df_bridge)
+    # Rename to internal convention for bridge service
+    df_internal = df_bridge.rename(columns={
+        'Customer':              'Customer_ID',
+        'Date':                  'Activity_Date',
+        'Month Lookback':        'Month_Lookback',
+        'Bridge Classification': 'Classification',
+        'Bridge Value':          'amount',
+    })
+    df_internal['Activity_Date']  = pd.to_datetime(df_internal['Activity_Date'])
+    df_internal['Month_Lookback'] = df_internal['Month_Lookback'].astype(int)
+    df_internal['amount']         = pd.to_numeric(df_internal['amount'], errors='coerce').fillna(0)
+
     yr = year_filter if year_filter else None
 
     results = {
         'metadata': {
-            'tool_type':   tool_type,
-            'revenue_unit': revenue_unit,
-            'row_count':   len(df_bridge),
-            'lookbacks':   lbs,
-            'dimensions':  dims,
-            'fiscal_years': sorted(df_bridge['Activity_Date'].dt.year.unique().tolist(), key=str) if not df_bridge.empty else [],
-            'classifications': sorted(df_bridge['Classification'].unique().tolist()) if not df_bridge.empty else [],
+            'tool_type':        tool_type,
+            'revenue_unit':     revenue_unit,
+            'row_count':        len(df_bridge),
+            'lookbacks':        lbs,
+            'dimensions':       dims,
+            'fiscal_years':     sorted(df_internal['Activity_Date'].dt.year.unique().tolist(), key=str),
+            'classifications':  sorted(df_internal['Classification'].unique().tolist()),
         }
     }
 
+    # Standard bridge analytics
+    df_filtered = filter_bridge_df(df_internal)
     results['bridge']        = {str(lb): get_bridge_summary(df_filtered, dims, lb, yr, period_type) for lb in lbs}
     results['fy_summary']    = get_fy_summary(df_filtered, 'Customer_ID', lbs[-1] if lbs else 12)
     results['top_movers']    = get_top_movers(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, n_movers, year_filter=yr, period_type=period_type)
@@ -254,14 +285,14 @@ async def analyze_mrr_raw(
     results['kpi_matrix']    = get_kpi_matrix(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, period_type)
     results['output']        = df_filtered.head(1000).replace({np.nan: None}).to_dict(orient='records')
 
-    # Add pivot-table format
+    # New pivot-table format (matches Excel output exactly)
     results['pivot'] = build_full_bridge_response(
-        df=df_filtered,
-        customer_col='Customer_ID',
-        lookbacks=lbs,
-        period_type=period_type,
-        dimension_cols=dims,
-        year_filter=yr,
+        df             = df_internal,
+        customer_col   = 'Customer_ID',
+        lookbacks      = lbs,
+        period_type    = period_type,
+        dimension_cols = dims,
+        year_filter    = yr,
     )
 
     return clean_json(results)

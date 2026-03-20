@@ -17,6 +17,7 @@ from services.mrr_bridge_service import (
 )
 from services.bridge_pivot_service import build_full_bridge_response
 from services.mrr_workflow_engine import run_mrr_workflow
+from services.acv_workflow_engine import run_acv_workflow
 
 app = FastAPI(title="RevenueLens API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
@@ -61,7 +62,7 @@ async def detect_columns(file: UploadFile = File(...)):
     preview = df.head(5).replace({np.nan: None}).to_dict(orient='records')
     cols_lower = [c.lower() for c in df.columns]
     is_bridge = any(k in cols_lower for k in ['bridge value', 'classification', 'bridge classification', 'month lookback'])
-    is_acv = any('tcv' in c or 'contract_end' in c for c in cols_lower)
+    is_acv = any(k in cols_lower for k in ['tcv','acv','contract_end','contract end','contractend']) or              any('contract' in c and ('end' in c or 'start' in c) for c in cols_lower)
     return clean_json({'columns': df.columns.tolist(), 'row_count': len(df),
                        'preview': preview, 'is_bridge_output': is_bridge, 'is_acv': is_acv})
 
@@ -286,6 +287,130 @@ async def analyze_mrr_raw(
     results['output']        = df_filtered.head(1000).replace({np.nan: None}).to_dict(orient='records')
 
     # New pivot-table format (matches Excel output exactly)
+    results['pivot'] = build_full_bridge_response(
+        df             = df_internal,
+        customer_col   = 'Customer_ID',
+        lookbacks      = lbs,
+        period_type    = period_type,
+        dimension_cols = dims,
+        year_filter    = yr,
+    )
+
+    return clean_json(results)
+
+@app.post('/api/acv/analyze')
+async def analyze_acv_raw(
+    file:             UploadFile = File(...),
+    customer_col:     str = Form('Customer'),
+    order_date_col:   str = Form('Order Date'),
+    start_col:        str = Form('Contract Start Date'),
+    end_col:          str = Form('Contract End Date'),
+    tcv_col:          str = Form('TCV'),
+    product_col:      str = Form('Product'),
+    channel_col:      str = Form('Channel'),
+    region_col:       str = Form(''),
+    quantity_col:     str = Form(''),
+    revenue_unit:     str = Form('raw'),
+    lookbacks:        str = Form('[1,3,12]'),
+    dimension_cols:   str = Form('[]'),
+    period_type:      str = Form('Annual'),
+    year_filter:      str = Form(''),
+    n_movers:         int = Form(30),
+    n_customers:      int = Form(10),
+):
+    """
+    Run the full ACV workflow engine on raw contract/booking data.
+    Produces bridge table, ACV table, and bookings table.
+    """
+    df_raw = load_df(file)
+    df_raw.columns = df_raw.columns.str.strip()
+
+    lbs  = json.loads(lookbacks)
+    dims = [d for d in json.loads(dimension_cols) if d in df_raw.columns]
+
+    # Case-insensitive column matching
+    col_lower = {c.lower().replace(' ', '_'): c for c in df_raw.columns}
+    def find_col(target, fallbacks=[]):
+        for c in [target] + fallbacks:
+            if c in df_raw.columns: return c
+            norm = c.lower().replace(' ', '_')
+            if norm in col_lower: return col_lower[norm]
+        return None
+
+    customer_col   = find_col(customer_col,   ['customer','customer_id','client','account']) or customer_col
+    order_date_col = find_col(order_date_col,  ['order_date','signing_date','date'])          or order_date_col
+    start_col      = find_col(start_col,       ['contract_start','start_date','start'])       or start_col
+    end_col        = find_col(end_col,         ['contract_end','end_date','expiry','end'])     or end_col
+    tcv_col        = find_col(tcv_col,         ['tcv','acv','total_contract','contract_value','amount']) or tcv_col
+
+    for col in [customer_col, start_col, end_col, tcv_col]:
+        if col not in df_raw.columns:
+            raise HTTPException(400, f"Column '{col}' not found. Available: {list(df_raw.columns)}")
+
+    try:
+        result = run_acv_workflow(
+            df_raw          = df_raw,
+            customer_col    = customer_col,
+            order_date_col  = order_date_col if order_date_col in df_raw.columns else start_col,
+            start_col       = start_col,
+            end_col         = end_col,
+            tcv_col         = tcv_col,
+            product_col     = product_col   if product_col   in df_raw.columns else None,
+            channel_col     = channel_col   if channel_col   in df_raw.columns else None,
+            region_col      = region_col    if region_col    in df_raw.columns else None,
+            quantity_col    = quantity_col  if quantity_col  in df_raw.columns else None,
+            lookback_months = lbs,
+            revenue_unit    = revenue_unit,
+        )
+    except Exception as e:
+        raise HTTPException(500, f'ACV workflow failed: {str(e)}')
+
+    df_bridge = result['bridge']
+    if df_bridge.empty:
+        raise HTTPException(400, 'No output after ACV workflow. Check contract start/end and TCV columns.')
+
+    # Rename to internal convention (ACV uses 'ACV New' column)
+    df_internal = df_bridge.rename(columns={
+        'Customer':              'Customer_ID',
+        'Date':                  'Activity_Date',
+        'Month Lookback':        'Month_Lookback',
+        'Bridge Classification': 'Classification',
+        'Bridge Value':          'amount',
+        'ACV New':               'ACV_New',
+        'DTE New':               'DTE',
+    })
+    df_internal['Activity_Date']  = pd.to_datetime(df_internal['Activity_Date'])
+    df_internal['Month_Lookback'] = df_internal['Month_Lookback'].astype(int)
+    df_internal['amount']         = pd.to_numeric(df_internal['amount'], errors='coerce').fillna(0)
+
+    yr = year_filter if year_filter else None
+
+    results = {
+        'metadata': {
+            'tool_type':       'ACV',
+            'revenue_unit':    revenue_unit,
+            'row_count':       len(df_bridge),
+            'lookbacks':       lbs,
+            'dimensions':      dims,
+            'fiscal_years':    sorted(df_internal['Activity_Date'].dt.year.unique().tolist(), key=str),
+            'classifications': sorted(df_internal['Classification'].unique().tolist()),
+        }
+    }
+
+    # Bridge analytics using existing service (works for both MRR and ACV)
+    df_filtered = filter_bridge_df(df_internal)
+    results['bridge']        = {str(lb): get_bridge_summary(df_filtered, dims, lb, yr, period_type) for lb in lbs}
+    results['fy_summary']    = get_fy_summary(df_filtered, 'Customer_ID', lbs[-1] if lbs else 12)
+    results['top_movers']    = get_top_movers(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, n_movers, year_filter=yr, period_type=period_type)
+    results['top_customers'] = get_top_customers(df_filtered, 'Customer_ID', dims[:2], lbs[-1] if lbs else 12, n_customers, period_type=period_type, year_filter=yr)
+    results['kpi_matrix']    = get_kpi_matrix(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, period_type)
+    results['output']        = df_filtered.head(1000).replace({np.nan: None}).to_dict(orient='records')
+
+    # ACV-specific tables
+    results['acv_table']     = result['acv'].head(500).replace({np.nan: None}).to_dict(orient='records')
+    results['bookings']      = result['bookings'].head(500).replace({np.nan: None}).to_dict(orient='records')
+
+    # Pivot tables
     results['pivot'] = build_full_bridge_response(
         df             = df_internal,
         customer_col   = 'Customer_ID',

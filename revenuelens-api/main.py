@@ -252,12 +252,16 @@ async def analyze_mrr_raw(
         raise HTTPException(400, 'No output after MRR workflow. Check date and revenue columns.')
 
     # Rename to internal convention for bridge service
+    # Output cols: Customer, Product, Channel, Region, Vintage, Date,
+    #              MRR or ARR, Quantity, Month Lookback, Lookback Date,
+    #              Bridge Classification, Bridge Value
     df_internal = df_bridge.rename(columns={
         'Customer':              'Customer_ID',
         'Date':                  'Activity_Date',
         'Month Lookback':        'Month_Lookback',
         'Bridge Classification': 'Classification',
         'Bridge Value':          'amount',
+        'MRR or ARR':            'MRR_or_ARR',
     })
     df_internal['Activity_Date']  = pd.to_datetime(df_internal['Activity_Date'])
     df_internal['Month_Lookback'] = df_internal['Month_Lookback'].astype(int)
@@ -369,7 +373,10 @@ async def analyze_acv_raw(
     if df_bridge.empty:
         raise HTTPException(400, 'No output after ACV workflow. Check contract start/end and TCV columns.')
 
-    # Rename to internal convention (ACV uses 'ACV New' column)
+    # Rename to internal convention
+    # ACV output cols: Customer, Product, Channel, Region, Vintage, Date,
+    #                  ACV New, Quantity, Month Lookback, DTE New,
+    #                  Bridge Classification, Bridge Value
     df_internal = df_bridge.rename(columns={
         'Customer':              'Customer_ID',
         'Date':                  'Activity_Date',
@@ -377,7 +384,7 @@ async def analyze_acv_raw(
         'Bridge Classification': 'Classification',
         'Bridge Value':          'amount',
         'ACV New':               'ACV_New',
-        'DTE New':               'DTE',
+        'DTE New':               'DTE_New',
     })
     df_internal['Activity_Date']  = pd.to_datetime(df_internal['Activity_Date'])
     df_internal['Month_Lookback'] = df_internal['Month_Lookback'].astype(int)

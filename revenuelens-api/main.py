@@ -15,6 +15,7 @@ from services.mrr_bridge_service import (
     get_bridge_by_dimension, get_fy_summary, get_top_movers,
     get_top_customers, get_kpi_matrix, compute_mrr_bridge_from_raw
 )
+from services.bridge_pivot_service import build_full_bridge_response
 
 app = FastAPI(title="RevenueLens API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
@@ -121,6 +122,16 @@ async def analyze_bridge(
 
     if 'output' in mods:
         results['output'] = df_filtered.head(1000).replace({np.nan: None}).to_dict(orient='records')
+
+    # Add new pivot-table format response
+    results['pivot'] = build_full_bridge_response(
+        df=df_filtered,
+        customer_col=customer_col,
+        lookbacks=lbs,
+        period_type=period_type,
+        dimension_cols=dims,
+        year_filter=yr,
+    )
 
     return clean_json(results)
 
@@ -242,5 +253,15 @@ async def analyze_mrr_raw(
     results['top_customers'] = get_top_customers(df_filtered, 'Customer_ID', dims[:2], lbs[-1] if lbs else 12, n_customers, period_type=period_type, year_filter=yr)
     results['kpi_matrix']    = get_kpi_matrix(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, period_type)
     results['output']        = df_filtered.head(1000).replace({np.nan: None}).to_dict(orient='records')
+
+    # Add pivot-table format
+    results['pivot'] = build_full_bridge_response(
+        df=df_filtered,
+        customer_col='Customer_ID',
+        lookbacks=lbs,
+        period_type=period_type,
+        dimension_cols=dims,
+        year_filter=yr,
+    )
 
     return clean_json(results)

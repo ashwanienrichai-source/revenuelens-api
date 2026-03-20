@@ -72,16 +72,20 @@ def load_bridge_file(
     col_lower = {c.lower(): c for c in df.columns}
 
     for src, dst in [
-        ('bridge value', 'amount'),
-        ('customer',     'Customer_ID'),
-        ('customer id',  'Customer_ID'),
-        ('customer_id',  'Customer_ID'),
-        ('date',         'Activity_Date'),
-        ('activity_date','Activity_Date'),
-        ('month lookback','Month_Lookback'),
-        ('month_lookback','Month_Lookback'),
-        ('classification','Classification'),
-        ('bridge classification','Classification'),
+        ('bridge value',          'amount'),
+        ('customer',              'Customer_ID'),
+        ('customer id',           'Customer_ID'),
+        ('customer_id',           'Customer_ID'),
+        ('date',                  'Activity_Date'),
+        ('activity_date',         'Activity_Date'),
+        ('month lookback',        'Month_Lookback'),
+        ('month_lookback',        'Month_Lookback'),
+        ('classification',        'Classification'),
+        ('bridge classification', 'Classification'),
+        ('mrr or arr',            'MRR_or_ARR'),
+        ('mrr_or_arr',            'MRR_or_ARR'),
+        ('acv new',               'ACV_New'),
+        ('dte new',               'DTE_New'),
     ]:
         if src in col_lower and dst not in df.columns:
             rename_map[col_lower[src]] = dst
@@ -205,14 +209,16 @@ def get_bridge_summary(
     by_period = by_period_pivot.to_dict(orient='records')
 
     # ── Retention metrics ─────────────────────────────────────────────
-    beg_col = next((c for c in ['Beginning MRR', 'Prior ACV', 'Beginning MRR or ARR', 'Beginning ARR'] if c in sub['Classification'].values), None)
-    beg = float(sub[sub['Classification'].isin(['Beginning MRR', 'Prior ACV', 'Beginning MRR or ARR', 'Beginning ARR'])]['amount'].sum())
-    ch  = float(sub[sub['Classification'].isin(['Churn', 'Churn Partial', 'Churn-Partial'])]['amount'].sum())
+    BEG_CLASSES = {'Beginning MRR', 'Prior ACV', 'Beginning MRR or ARR', 'Beginning ARR'}
+    END_CLASSES = {'Ending MRR', 'Ending ACV', 'Ending MRR or ARR', 'Ending ARR'}
+    CHURN_CLASSES = {'Churn', 'Churn Partial', 'Churn-Partial'}
+    beg = float(sub[sub['Classification'].isin(BEG_CLASSES)]['amount'].sum())
+    ch  = float(sub[sub['Classification'].isin(CHURN_CLASSES)]['amount'].sum())
     dw  = float(sub[sub['Classification'] == 'Downsell']['amount'].sum())
     up  = float(sub[sub['Classification'] == 'Upsell']['amount'].sum())
     nl  = float(sub[sub['Classification'] == 'New Logo']['amount'].sum())
     cr  = float(sub[sub['Classification'] == 'Cross-sell']['amount'].sum())
-    end = float(sub[sub['Classification'].isin(['Ending MRR', 'Ending ACV', 'Ending MRR or ARR', 'Ending ARR'])]['amount'].sum())
+    end = float(sub[sub['Classification'].isin(END_CLASSES)]['amount'].sum())
 
     def safe(n, d): return round(n / d * 100, 1) if d and d != 0 else None
 

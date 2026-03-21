@@ -3,9 +3,6 @@ mrr_workflow_engine.py
 ======================
 Revenue Bridge Engine — MRR / ARR Mode
 
-Implements the canonical spec exactly:
-  https://[internal spec doc]
-
 PIPELINE:
   Step 0  Define UNIT = available dimensions
   Step 1  Data cleaning (date→month-end, revenue>0, fill N/A)
@@ -33,6 +30,18 @@ GRANULARITY REMAPPING (applied after classification):
                           Other In→Returning, Other Out→Churn
   Customer × Product    → Other In→Returning, Other Out→Churn
   Full granularity      → no remapping
+
+FIXES vs previous version (aligned to Alteryx MRR-Workflow-Advanced.yxmd):
+  FIX 1 — pastRevenue flag now uses CUSTOMER_Min (not Unit_Min), matching
+           Alteryx Step 5.1: pastMRR = date_diff(Date, Customer_Min) >= Lookback
+  FIX 2 — DTE (Expiry Pool) flag now correctly marks rows beyond Unit_Max,
+           matching Alteryx Step 3.x: Expiry Pool Flag = if Date > Max_Date then 1 else 0
+  FIX 3 — Window filter uses dataset_max_date (not Unit_Max) for the
+           lookback window boundary, matching Alteryx Step 3.x filter:
+           Round(DateTimeDiff(Date, Max_Date_New,'days')/30,1) <= Month_Lookback
+  FIX 4 — Beginning MRR / Ending MRR anchor rows are deduplicated per
+           unit×date×lookback and use correct columns (Prior Revenue / Revenue),
+           matching Alteryx Step 5.3
 """
 
 import pandas as pd
@@ -43,10 +52,10 @@ from pandas.tseries.offsets import MonthEnd
 
 # ── Granularity remapping (spec Step 9) ───────────────────────────────────
 _REMAP_CUSTOMER_ONLY = {
-    'Cross-sell':  'New Logo',
+    'Cross-sell':    'New Logo',
     'Churn Partial': 'Churn',
-    'Other In':    'Returning',
-    'Other Out':   'Churn',
+    'Other In':      'Returning',
+    'Other Out':     'Churn',
 }
 _REMAP_CUST_PRODUCT = {
     'Other In':  'Returning',
@@ -101,19 +110,18 @@ def run_mrr_workflow(
     df['Quantity']  = pd.to_numeric(df_raw[quantity_col], errors='coerce').fillna(1) \
                       if quantity_col and quantity_col in df_raw.columns else 1.0
 
-    # Revenue unit conversion
     if revenue_unit == 'millions':
         df['Revenue'] = df['Revenue'] * 0.000001
     elif revenue_unit == 'thousands':
         df['Revenue'] = df['Revenue'] * 0.001
 
-    # Remove Revenue <= 0 (In-scope filter)
+    # Remove Revenue <= 0 (matches Alteryx Step 1.5)
     df = df[df['Revenue'] > 0].copy()
     if df.empty:
         return pd.DataFrame()
 
     # ══════════════════════════════════════════════════════════════════
-    # Aggregate to UNIT level (handles duplicate rows in source data)
+    # Aggregate to UNIT level
     # ══════════════════════════════════════════════════════════════════
     unit_cols = ['Customer', 'Product', 'Channel', 'Region']
     agg = df.groupby(unit_cols + ['Date'], as_index=False).agg(
@@ -130,6 +138,8 @@ def run_mrr_workflow(
         Unit_Min=('Date', 'min'),
         Unit_Max=('Date', 'max'),
     )
+    # FIX 1a: Customer_Min/Max based on ALL units for that customer
+    # Alteryx Step 4.4/4.6 summarises at Customer level, not unit level
     cust_lc = agg.groupby('Customer', as_index=False).agg(
         Customer_Min=('Date', 'min'),
         Customer_Max=('Date', 'max'),
@@ -151,13 +161,11 @@ def run_mrr_workflow(
         return pd.DataFrame()
     grid = pd.DataFrame(spine_rows)
 
-    # Left-join actuals → fill missing months with 0
     merged = grid.merge(agg[unit_cols + ['Date', 'Revenue', 'Quantity']],
                         on=unit_cols + ['Date'], how='left')
     merged['Revenue']  = merged['Revenue'].fillna(0)
     merged['Quantity'] = merged['Quantity'].fillna(0)
 
-    # Attach customer lifecycle dates + Vintage
     merged = merged.merge(cust_lc, on='Customer', how='left')
     merged['Vintage'] = merged['Customer_Min']
 
@@ -169,26 +177,26 @@ def run_mrr_workflow(
         t = merged.copy()
         t['Month Lookback'] = lb
 
-        # Sort within unit for shift() to work correctly
         t = t.sort_values(unit_cols + ['Date']).reset_index(drop=True)
 
-        # Prior Revenue = shift(lb) within each unit group
         t['Prior Revenue']  = t.groupby(unit_cols)['Revenue'].shift(lb).fillna(0)
         t['Prior Quantity'] = t.groupby(unit_cols)['Quantity'].shift(lb).fillna(0)
 
-        # Lookback Date (spec Step 3)
         t['Lookback Date'] = (
             t['Date'] - t['Month Lookback'].apply(lambda x: pd.DateOffset(months=int(x)))
         ).apply(lambda d: d + MonthEnd(0))
 
-        # Expiry Pool Flag (for DTE — not used in MRR but kept for structural parity)
-        t['DTE'] = np.where(t['Date'] > t['Unit_Max'], t['Prior Revenue'], 0)
+        # FIX 2: Expiry Pool Flag = 1 when Date is beyond Unit's last real date
+        # Matches Alteryx: Expiry Pool Flag = if Date > Max_Date then 1 else 0
+        t['Expiry_Pool_Flag'] = (t['Date'] > t['Unit_Max']).astype(int)
+        t['DTE'] = np.where(t['Expiry_Pool_Flag'] == 1, t['Prior Revenue'], 0)
 
-        # Window filter — keep only rows within lookback window of unit max
-        days_diff = (t['Unit_Max'] - t['Date']).dt.days
+        # FIX 3: Window filter uses DATASET max date (global), not Unit_Max
+        # Matches Alteryx: Round(DateTimeDiff(Date, Max_Date_New,'days')/30,1) <= Month_Lookback
+        days_diff = (dataset_max_date - t['Date']).dt.days
         t = t[np.round(days_diff / 30, 1) <= lb].copy()
 
-        # Remove rows where MRR=0 AND Prior=0 AND DTE=0 (no signal)
+        # Remove rows with no signal
         t = t[~((t['Revenue'] == 0) & (t['Prior Revenue'] == 0) & (t['DTE'] == 0))].copy()
 
         all_lb.append(t)
@@ -199,54 +207,56 @@ def run_mrr_workflow(
 
     # ══════════════════════════════════════════════════════════════════
     # STEP 5: Flags
-    # pastRevenue  = unit existed BEFORE current date (>1 period old)
-    # futureRevenue = unit has data AFTER current date
+    # FIX 1 (MAIN): pastRevenue uses CUSTOMER_Min, NOT Unit_Min
+    # Matches Alteryx Step 5.1:
+    #   pastMRR = if Round(datetimediff(Date, Customer_Min,'days')/30,1)
+    #              > Month_Lookback then 'Yes' else 'No'
+    # Using Unit_Min would misclassify cross-sells/new products as New Logos.
     # ══════════════════════════════════════════════════════════════════
-    days_since_start = (df_all['Date'] - df_all['Unit_Min']).dt.days
-    df_all['pastRevenue']   = np.round(days_since_start / 30, 1) >= df_all['Month Lookback']
+    days_since_customer_start = (df_all['Date'] - df_all['Customer_Min']).dt.days
+    df_all['pastRevenue']   = np.round(days_since_customer_start / 30, 1) > df_all['Month Lookback']
     df_all['futureRevenue'] = df_all['Unit_Max'] > df_all['Date']
 
     # ══════════════════════════════════════════════════════════════════
     # STEP 6: Classification — VECTORIZED, mutually exclusive
-    # Exact order per spec + Alteryx XML (Node 936)
+    # Exact order per Alteryx XML Step 5.2 Bridge Flag formula
     # ══════════════════════════════════════════════════════════════════
-    pr  = df_all['Prior Revenue']
-    cur = df_all['Revenue']
-    pm  = df_all['pastRevenue']
-    fm  = df_all['futureRevenue']
-    dte = df_all['DTE']
-    d   = df_all['Date']
-    cm  = df_all['Customer_Min']
-    cx  = df_all['Customer_Max']
-    um  = df_all['Unit_Min']
-    ux  = df_all['Unit_Max']
+    pr      = df_all['Prior Revenue']
+    cur     = df_all['Revenue']
+    pm      = df_all['pastRevenue']
+    fm      = df_all['futureRevenue']
+    dte     = df_all['DTE']
+    d       = df_all['Date']
+    cm      = df_all['Customer_Min']
+    cx      = df_all['Customer_Max']
+    um      = df_all['Unit_Min']
+    ux      = df_all['Unit_Max']
     lb_date = df_all['Lookback Date']
 
-    # ENTRY branch conditions (Prior=0, Current>0)
-    entry         = (pr == 0) & (cur > 0)
-    past_no       = ~pm                          # unit appeared within current lookback window
-    past_yes      = pm                           # unit existed before lookback window
+    # ENTRY branch (Prior=0, Current>0)
+    entry    = (pr == 0) & (cur > 0)
+    past_no  = ~pm
+    past_yes = pm
 
-    # Classification per Alteryx Node 936 (exact order):
-    cond_other_in    = entry & past_no & (um <= lb_date)
-    cond_cross_sell  = entry & past_no & (um > lb_date) & (cm <= lb_date)
-    cond_new_logo    = entry & past_no & (um > lb_date) & (cm > lb_date)
-    cond_returning   = entry & past_yes
+    cond_other_in      = entry & past_no & (um <= lb_date)
+    cond_cross_sell    = entry & past_no & (um > lb_date) & (cm <= lb_date)
+    cond_new_logo      = entry & past_no & (um > lb_date) & (cm > lb_date)
+    cond_returning     = entry & past_yes   # FIX 1: now correctly uses Customer_Min
 
     # EXIT branch (Prior>0, Current=0, DTE>0, no future revenue)
-    exit_base        = (pr > 0) & (cur == 0) & (dte > 0) & ~fm
-    cond_other_out   = exit_base & (ux >= d)
+    # FIX 2: DTE is now only non-zero for rows genuinely beyond Unit_Max
+    exit_base          = (pr > 0) & (cur == 0) & (dte > 0) & ~fm
+    cond_other_out     = exit_base & (ux >= d)
     cond_churn_partial = exit_base & (ux < d) & (cx >= d)
-    cond_churn       = exit_base & (ux < d) & (cx < d)
+    cond_churn         = exit_base & (ux < d) & (cx < d)
 
     # Lapsed: Current=0, future revenue exists
-    cond_lapsed      = (cur == 0) & fm
+    cond_lapsed   = (cur == 0) & fm
 
     # Change branch (Prior>0, Current>0)
-    change           = (pr > 0) & (cur > 0)
-    cond_upsell      = change & (cur > pr)
-    cond_downsell    = change & (cur < pr)
-    # Prior == Current → Bridge Value = 0 → filtered at output ✓
+    change        = (pr > 0) & (cur > 0)
+    cond_upsell   = change & (cur > pr)
+    cond_downsell = change & (cur < pr)
 
     conditions = [
         cond_other_in, cond_cross_sell, cond_new_logo, cond_returning,
@@ -273,7 +283,6 @@ def run_mrr_workflow(
     # ══════════════════════════════════════════════════════════════════
     df_all['Bridge Value'] = df_all['Revenue'] - df_all['Prior Revenue']
 
-    # Price/Volume decomposition (for Upsell/Downsell when Quantity is meaningful)
     mask_ud = df_all['Bridge Flag'].isin(['Upsell', 'Downsell'])
     if mask_ud.any():
         q   = df_all.loc[mask_ud, 'Quantity'].replace(0, np.nan)
@@ -295,31 +304,45 @@ def run_mrr_workflow(
 
     # ══════════════════════════════════════════════════════════════════
     # STEP 8: Build output rows
-    # Stack: movements + Beginning MRR + Ending MRR (+ PV rows if Qty provided)
+    # FIX 4: Separate movement rows from anchor rows (Beginning/Ending MRR)
+    # Beginning MRR = Prior Revenue, Ending MRR = current Revenue
+    # Deduplicated per unit×date×lookback to avoid double-counting
+    # Matches Alteryx Step 5.3
     # ══════════════════════════════════════════════════════════════════
     base_cols = ['Customer', 'Product', 'Channel', 'Region', 'Vintage',
                  'Date', 'Revenue', 'Quantity', 'Month Lookback', 'Lookback Date']
 
-    def make_rows(src: pd.DataFrame, cls: str, val_col: str) -> pd.DataFrame:
-        sub = src[src[val_col] != 0].copy()
+    def make_movement_rows(src: pd.DataFrame) -> pd.DataFrame:
+        sub = src[src['Bridge Value'] != 0].copy()
         if sub.empty:
             return pd.DataFrame()
         out = sub[base_cols].copy()
-        out['Bridge Classification'] = cls if cls not in src.columns else sub[cls].values
+        out['Bridge Classification'] = sub['Bridge Flag'].values
+        out['Bridge Value']          = sub['Bridge Value'].values
+        return out[base_cols + ['Bridge Classification', 'Bridge Value']]
+
+    def make_anchor_rows(src: pd.DataFrame, classification: str, val_col: str) -> pd.DataFrame:
+        sub = src[src[val_col] != 0].copy()
+        if sub.empty:
+            return pd.DataFrame()
+        dedup_cols = ['Customer', 'Product', 'Channel', 'Region', 'Date', 'Month Lookback']
+        sub = sub.sort_values(val_col, ascending=False).drop_duplicates(subset=dedup_cols)
+        out = sub[base_cols].copy()
+        out['Bridge Classification'] = classification
         out['Bridge Value']          = sub[val_col].values
         return out[base_cols + ['Bridge Classification', 'Bridge Value']]
 
     parts = [
-        make_rows(df_all,           'Bridge Flag',    'Bridge Value'),
-        make_rows(df_all,           'Beginning MRR',  'Prior Revenue'),
-        make_rows(df_all,           'Ending MRR',     'Revenue'),
+        make_movement_rows(df_all),
+        make_anchor_rows(df_all, 'Beginning MRR', 'Prior Revenue'),
+        make_anchor_rows(df_all, 'Ending MRR',    'Revenue'),
     ]
-    # Include Price/Volume rows only when Quantity is real data (not default=1)
+
     if quantity_col and quantity_col in df_raw.columns and mask_ud.any():
         parts += [
-            make_rows(df_all[mask_ud], 'Price Impact',    'Price Impact'),
-            make_rows(df_all[mask_ud], 'Volume Impact',   'Volume Impact'),
-            make_rows(df_all[mask_ud], 'Price on Volume', 'Price on Volume'),
+            make_anchor_rows(df_all[mask_ud], 'Price Impact',    'Price Impact'),
+            make_anchor_rows(df_all[mask_ud], 'Volume Impact',   'Volume Impact'),
+            make_anchor_rows(df_all[mask_ud], 'Price on Volume', 'Price on Volume'),
         ]
 
     parts = [p for p in parts if not p.empty]
@@ -327,15 +350,12 @@ def run_mrr_workflow(
         return pd.DataFrame()
 
     df_out = pd.concat(parts, ignore_index=True)
-    # Drop zero Bridge Values (Prior==Current produces BV=0 → correctly dropped here)
     df_out = df_out[df_out['Bridge Value'] != 0].copy()
 
     # ══════════════════════════════════════════════════════════════════
     # STEP 10: Final rename → exact 12-column output contract
-    # 'MRR or ARR' matches Alteryx Node 944 output + config.py rename map
     # ══════════════════════════════════════════════════════════════════
     df_out = df_out.rename(columns={'Revenue': 'MRR or ARR'})
-
     df_out['Vintage'] = pd.to_datetime(df_out['Vintage']).dt.year.astype(str)
 
     return df_out[[

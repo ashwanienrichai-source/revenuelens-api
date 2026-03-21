@@ -1,27 +1,38 @@
 """
 mrr_workflow_engine.py
+======================
+Revenue Bridge Engine — MRR / ARR Mode
 
-Exact Python replication of MRR_Workflow_Advanced.yxmd
+Implements the canonical spec exactly:
+  https://[internal spec doc]
 
-OUTPUT — 12 columns exactly (matching Alteryx Node 944 output names):
+PIPELINE:
+  Step 0  Define UNIT = available dimensions
+  Step 1  Data cleaning (date→month-end, revenue>0, fill N/A)
+  Step 2  Time series spine (every month per unit, fill zeros)
+  Step 3  Lookback calculation (Prior Revenue, Prior Qty, Lookback Date)
+  Step 4  Metadata (Unit_Min/Max, Customer_Min/Max dates)
+  Step 5  Flags (pastRevenue, futureRevenue)
+  Step 6  Classification (vectorized, mutually exclusive)
+  Step 7  Bridge Value = Current - Prior
+  Step 8  Add Beginning MRR + Ending MRR rows
+  Step 9  Granularity remapping
+  Step 10 Final output — 12 exact columns
+
+OUTPUT — 12 columns (matching config.py downstream contract):
   Customer, Product, Channel, Region, Vintage, Date,
   MRR or ARR, Quantity, Month Lookback, Lookback Date,
   Bridge Classification, Bridge Value
 
-Bridge Classification values:
-  New Logo, Churn, Churn-Partial, Cross-sell, Upsell, Downsell,
-  Lapsed, Returning, Other In, Other Out,
-  Beginning MRR, Ending MRR,
-  Price Impact, Volume Impact, Price on Volume
+Classification values (CASE-SENSITIVE, matching config.py mrr_bridge_labels):
+  Beginning MRR, Churn, Churn Partial, Downsell, Upsell,
+  Other Out, Other In, Cross-sell, New Logo, Lapsed, Returning, Ending MRR
 
-Classification constraints by granularity (spec §CLASSIFICATION DEPENDENCY RULES):
-  Customer only (Product/Channel/Region all N/A):
-    Possible:   New Logo, Churn, Upsell, Downsell, Lapsed, Returning
-    Impossible: Churn-Partial, Cross-sell, Other In, Other Out
-  Customer × Product (Channel/Region N/A):
-    Possible:   above + Churn-Partial, Cross-sell
-    Impossible: Other In, Other Out
-  Full granularity: ALL classifications possible
+GRANULARITY REMAPPING (applied after classification):
+  Customer only         → Cross-sell→New Logo, Churn Partial→Churn,
+                          Other In→Returning, Other Out→Churn
+  Customer × Product    → Other In→Returning, Other Out→Churn
+  Full granularity      → no remapping
 """
 
 import pandas as pd
@@ -30,309 +41,305 @@ from typing import Optional, List
 from pandas.tseries.offsets import MonthEnd
 
 
-def _remap_by_granularity(flag: str, has_product: bool, has_channel_or_region: bool) -> str:
-    """
-    Remap classifications that are impossible at lower granularity.
-    Called AFTER bridge flag is computed — does not change the formula logic,
-    only collapses unreachable classes into their nearest valid equivalent.
-    """
+# ── Granularity remapping (spec Step 9) ───────────────────────────────────
+_REMAP_CUSTOMER_ONLY = {
+    'Cross-sell':  'New Logo',
+    'Churn Partial': 'Churn',
+    'Other In':    'Returning',
+    'Other Out':   'Churn',
+}
+_REMAP_CUST_PRODUCT = {
+    'Other In':  'Returning',
+    'Other Out': 'Churn',
+}
+
+def _remap(flag: str, has_product: bool, has_channel_or_region: bool) -> str:
     if not has_product:
-        # Customer-only: no product dimension
-        # Cross-sell → New Logo (new product of existing customer collapses to New Logo)
-        # Other In   → Returning (re-entry without product context)
-        # Other Out  → Churn     (exit without product context)
-        # Churn-Partial → Churn  (no product = no partial churn)
-        remap = {
-            'Cross-sell':    'New Logo',
-            'Other In':      'Returning',
-            'Other Out':     'Churn',
-            'Churn-Partial': 'Churn',
-        }
-        return remap.get(flag, flag)
-
+        return _REMAP_CUSTOMER_ONLY.get(flag, flag)
     if not has_channel_or_region:
-        # Customer × Product only: Other In / Other Out impossible
-        remap = {
-            'Other In':  'Returning',
-            'Other Out': 'Churn',
-        }
-        return remap.get(flag, flag)
-
+        return _REMAP_CUST_PRODUCT.get(flag, flag)
     return flag
 
 
 def run_mrr_workflow(
     df_raw: pd.DataFrame,
-    customer_col: str            = 'CustomerID',
-    date_col: str                = 'Period',
-    revenue_col: str             = 'Revenue',
-    product_col: Optional[str]   = None,
-    channel_col: Optional[str]   = None,
-    region_col: Optional[str]    = None,
-    quantity_col: Optional[str]  = None,
+    customer_col:  str           = 'CustomerID',
+    date_col:      str           = 'Period',
+    revenue_col:   str           = 'Revenue',
+    product_col:   Optional[str] = None,
+    channel_col:   Optional[str] = None,
+    region_col:    Optional[str] = None,
+    quantity_col:  Optional[str] = None,
     lookback_months: List[int]   = [1, 3, 12],
-    revenue_unit: str            = 'raw',
+    revenue_unit:  str           = 'raw',
 ) -> pd.DataFrame:
     """
-    Full MRR workflow engine. Returns bridge table with exactly 12 output columns.
-    Lookback and Bridge Classification are system-computed — never user inputs.
+    Full MRR/ARR bridge engine.
+    Returns bridge table with exactly 12 output columns.
+    Month Lookback and Bridge Classification are SYSTEM-COMPUTED — never user inputs.
     """
 
-    # ── STEP 1: Column mapping (Node 896) ─────────────────────────────
-    # Dimensions default to 'N/A' when not provided — this controls
-    # which bridge classifications are mathematically reachable.
-    df = pd.DataFrame()
-    df['Customer New']  = df_raw[customer_col].astype(str).str.strip()
-    df['Product New']   = df_raw[product_col].astype(str).str.strip()  if product_col  and product_col  in df_raw.columns else 'N/A'
-    df['Channel New']   = df_raw[channel_col].astype(str).str.strip()  if channel_col  and channel_col  in df_raw.columns else 'N/A'
-    df['Region New']    = df_raw[region_col].astype(str).str.strip()   if region_col   and region_col   in df_raw.columns else 'N/A'
-    df['Date New']      = pd.to_datetime(df_raw[date_col], errors='coerce') + MonthEnd(0)
-    df['MRR New']       = pd.to_numeric(df_raw[revenue_col], errors='coerce').fillna(0)
-    df['Quantity New']  = pd.to_numeric(df_raw[quantity_col], errors='coerce').fillna(1) \
-                          if quantity_col and quantity_col in df_raw.columns else 1.0
-
-    # Granularity flags — determine which classifications are reachable
-    has_product          = product_col is not None and product_col in df_raw.columns
-    has_channel_or_region = (
-        (channel_col is not None and channel_col in df_raw.columns) or
-        (region_col  is not None and region_col  in df_raw.columns)
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 0: Define UNIT — which dimensions are active
+    # ══════════════════════════════════════════════════════════════════
+    has_product           = bool(product_col and product_col in df_raw.columns)
+    has_channel_or_region = bool(
+        (channel_col and channel_col in df_raw.columns) or
+        (region_col  and region_col  in df_raw.columns)
     )
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 1: Data cleaning
+    # ══════════════════════════════════════════════════════════════════
+    df = pd.DataFrame()
+    df['Customer']  = df_raw[customer_col].astype(str).str.strip()
+    df['Product']   = df_raw[product_col].astype(str).str.strip() if has_product else 'N/A'
+    df['Channel']   = df_raw[channel_col].astype(str).str.strip() if channel_col and channel_col in df_raw.columns else 'N/A'
+    df['Region']    = df_raw[region_col].astype(str).str.strip()  if region_col  and region_col  in df_raw.columns else 'N/A'
+    df['Date']      = pd.to_datetime(df_raw[date_col], errors='coerce') + MonthEnd(0)
+    df['Revenue']   = pd.to_numeric(df_raw[revenue_col], errors='coerce').fillna(0)
+    df['Quantity']  = pd.to_numeric(df_raw[quantity_col], errors='coerce').fillna(1) \
+                      if quantity_col and quantity_col in df_raw.columns else 1.0
 
     # Revenue unit conversion
     if revenue_unit == 'millions':
-        df['MRR New'] = df['MRR New'] * 0.000001
+        df['Revenue'] = df['Revenue'] * 0.000001
     elif revenue_unit == 'thousands':
-        df['MRR New'] = df['MRR New'] * 0.001
+        df['Revenue'] = df['Revenue'] * 0.001
 
-    # ── STEP 2: In-scope filter (Node 1090) ───────────────────────────
-    df = df[df['MRR New'] > 0].copy()
+    # Remove Revenue <= 0 (In-scope filter)
+    df = df[df['Revenue'] > 0].copy()
     if df.empty:
         return pd.DataFrame()
 
-    # ── STEP 3: Dataset max date (Node 827) ───────────────────────────
-    dataset_max_date = df['Date New'].max()
-
-    # ── STEP 4: Aggregate to unit level (Node 835) ────────────────────
-    unit_cols = ['Customer New', 'Product New', 'Channel New', 'Region New']
-    agg = df.groupby(unit_cols + ['Date New'], as_index=False).agg(
-        MRR_New=('MRR New', 'sum'),
-        Qty_New=('Quantity New', 'sum'),
-    ).rename(columns={'MRR_New': 'MRR New', 'Qty_New': 'Quantity New'})
-
-    # ── STEP 5: Unit lifecycle min/max (Node 820) ─────────────────────
-    lc = agg.groupby(unit_cols, as_index=False).agg(
-        Min_Date=('Date New', 'min'),
-        Max_Date=('Date New', 'max'),
-    ).rename(columns={'Min_Date': 'Min Date New', 'Max_Date': 'Max Date New'})
-
-    # ── STEP 6: Monthly date spine (Node 823) ─────────────────────────
-    rows = []
-    for _, r in lc.iterrows():
-        for dt in pd.date_range(r['Min Date New'], dataset_max_date, freq='ME'):
-            rows.append({
-                'Customer New':  r['Customer New'],
-                'Product New':   r['Product New'],
-                'Channel New':   r['Channel New'],
-                'Region New':    r['Region New'],
-                'Min Date New':  r['Min Date New'],
-                'Max Date New':  r['Max Date New'],
-                'Date New':      dt,
-            })
-    if not rows:
-        return pd.DataFrame()
-    grid = pd.DataFrame(rows)
-
-    # ── STEP 7: Left-join actuals onto spine (Nodes 824/825/826) ──────
-    merged = grid.merge(
-        agg[unit_cols + ['Date New', 'MRR New', 'Quantity New']],
-        on=unit_cols + ['Date New'], how='left'
+    # ══════════════════════════════════════════════════════════════════
+    # Aggregate to UNIT level (handles duplicate rows in source data)
+    # ══════════════════════════════════════════════════════════════════
+    unit_cols = ['Customer', 'Product', 'Channel', 'Region']
+    agg = df.groupby(unit_cols + ['Date'], as_index=False).agg(
+        Revenue=('Revenue', 'sum'),
+        Quantity=('Quantity', 'sum'),
     )
-    merged['MRR New']      = merged['MRR New'].fillna(0)
-    merged['Quantity New'] = merged['Quantity New'].fillna(0)
 
-    # ── STEP 8: Customer-level lifecycle (Node 946) ───────────────────
-    cust_lc = merged.groupby('Customer New', as_index=False).agg(
-        cust_min=('Date New', 'min'),
-        cust_max=('Date New', 'max'),
-    ).rename(columns={'cust_min': 'Customer Min Date New', 'cust_max': 'Customer Max Date New'})
-    merged = merged.merge(cust_lc, on='Customer New', how='left')
+    dataset_max_date = agg['Date'].max()
 
-    # ── STEP 9: Vintage (Node 950) ────────────────────────────────────
-    merged['Vintage New'] = merged['Customer Min Date New']
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 4: Metadata — unit and customer lifecycle dates
+    # ══════════════════════════════════════════════════════════════════
+    unit_lc = agg.groupby(unit_cols, as_index=False).agg(
+        Unit_Min=('Date', 'min'),
+        Unit_Max=('Date', 'max'),
+    )
+    cust_lc = agg.groupby('Customer', as_index=False).agg(
+        Customer_Min=('Date', 'min'),
+        Customer_Max=('Date', 'max'),
+    )
 
-    # ── STEP 10: CustProd lifecycle (Node 947) ────────────────────────
-    cp_lc = merged.groupby(['Customer New', 'Product New'], as_index=False).agg(
-        cp_min=('Date New', 'min'),
-        cp_max=('Date New', 'max'),
-    ).rename(columns={'cp_min': 'CustProd_Min_Date', 'cp_max': 'CustProd_Max_Date'})
-    merged = merged.merge(cp_lc, on=['Customer New', 'Product New'], how='left')
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 2: Time series spine — every month from Unit_Min to dataset max
+    # ══════════════════════════════════════════════════════════════════
+    spine_rows = []
+    for _, r in unit_lc.iterrows():
+        for dt in pd.date_range(r['Unit_Min'], dataset_max_date, freq='ME'):
+            spine_rows.append({
+                'Customer': r['Customer'], 'Product': r['Product'],
+                'Channel':  r['Channel'],  'Region':  r['Region'],
+                'Unit_Min': r['Unit_Min'], 'Unit_Max': r['Unit_Max'],
+                'Date':     dt,
+            })
+    if not spine_rows:
+        return pd.DataFrame()
+    grid = pd.DataFrame(spine_rows)
 
-    # ── STEP 11: Lookback branches (Nodes 902–933) ────────────────────
+    # Left-join actuals → fill missing months with 0
+    merged = grid.merge(agg[unit_cols + ['Date', 'Revenue', 'Quantity']],
+                        on=unit_cols + ['Date'], how='left')
+    merged['Revenue']  = merged['Revenue'].fillna(0)
+    merged['Quantity'] = merged['Quantity'].fillna(0)
+
+    # Attach customer lifecycle dates + Vintage
+    merged = merged.merge(cust_lc, on='Customer', how='left')
+    merged['Vintage'] = merged['Customer_Min']
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 3: Lookback calculation — one pass per lookback period
+    # ══════════════════════════════════════════════════════════════════
     all_lb = []
     for lb in lookback_months:
         t = merged.copy()
         t['Month Lookback'] = lb
 
-        # Filter within lookback window from unit's max actual date (Node 907)
-        days_diff = (t['Max Date New'] - t['Date New']).dt.days
+        # Sort within unit for shift() to work correctly
+        t = t.sort_values(unit_cols + ['Date']).reset_index(drop=True)
+
+        # Prior Revenue = shift(lb) within each unit group
+        t['Prior Revenue']  = t.groupby(unit_cols)['Revenue'].shift(lb).fillna(0)
+        t['Prior Quantity'] = t.groupby(unit_cols)['Quantity'].shift(lb).fillna(0)
+
+        # Lookback Date (spec Step 3)
+        t['Lookback Date'] = (
+            t['Date'] - t['Month Lookback'].apply(lambda x: pd.DateOffset(months=int(x)))
+        ).apply(lambda d: d + MonthEnd(0))
+
+        # Expiry Pool Flag (for DTE — not used in MRR but kept for structural parity)
+        t['DTE'] = np.where(t['Date'] > t['Unit_Max'], t['Prior Revenue'], 0)
+
+        # Window filter — keep only rows within lookback window of unit max
+        days_diff = (t['Unit_Max'] - t['Date']).dt.days
         t = t[np.round(days_diff / 30, 1) <= lb].copy()
 
-        # Expiry Pool Flag (Node 921): date beyond unit's last actual data
-        t['Expiry Pool Flag'] = np.where(t['Date New'] > t['Max Date New'], 1, 0)
-
-        # Sort for shift() lookup — must be sorted by unit + date
-        t = t.sort_values(unit_cols + ['Date New']).reset_index(drop=True)
-
-        # Prior MRR = shift(N) within unit group (Nodes 915/919/923)
-        t['Prior MRR New']      = t.groupby(unit_cols)['MRR New'].shift(lb).fillna(0)
-        t['Prior Quantity New'] = t.groupby(unit_cols)['Quantity New'].shift(lb).fillna(0)
-
-        # DTE (Node 925)
-        t['DTE New'] = np.where(t['Expiry Pool Flag'] == 1, t['Prior MRR New'], 0)
+        # Remove rows where MRR=0 AND Prior=0 AND DTE=0 (no signal)
+        t = t[~((t['Revenue'] == 0) & (t['Prior Revenue'] == 0) & (t['DTE'] == 0))].copy()
 
         all_lb.append(t)
 
     df_all = pd.concat(all_lb, ignore_index=True)
+    if df_all.empty:
+        return pd.DataFrame()
 
-    # Remove all-zero rows (Node 934)
-    df_all = df_all[~(
-        (df_all['MRR New'] == 0) &
-        (df_all['Prior MRR New'] == 0) &
-        (df_all['DTE New'] == 0)
-    )].copy()
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 5: Flags
+    # pastRevenue  = unit existed BEFORE current date (>1 period old)
+    # futureRevenue = unit has data AFTER current date
+    # ══════════════════════════════════════════════════════════════════
+    days_since_start = (df_all['Date'] - df_all['Unit_Min']).dt.days
+    df_all['pastRevenue']   = np.round(days_since_start / 30, 1) >= df_all['Month Lookback']
+    df_all['futureRevenue'] = df_all['Unit_Max'] > df_all['Date']
 
-    # ── STEP 12: Past/Future flags (Node 935) ─────────────────────────
-    days_from_start = (df_all['Date New'] - df_all['Min Date New']).dt.days
-    df_all['pastMRR New']   = np.where(
-        np.round(days_from_start / 30, 1) < df_all['Month Lookback'], 'No', 'Yes'
-    )
-    df_all['futureMRR New'] = np.where(
-        df_all['Max Date New'] > df_all['Date New'], 'Yes', 'No'
-    )
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 6: Classification — VECTORIZED, mutually exclusive
+    # Exact order per spec + Alteryx XML (Node 936)
+    # ══════════════════════════════════════════════════════════════════
+    pr  = df_all['Prior Revenue']
+    cur = df_all['Revenue']
+    pm  = df_all['pastRevenue']
+    fm  = df_all['futureRevenue']
+    dte = df_all['DTE']
+    d   = df_all['Date']
+    cm  = df_all['Customer_Min']
+    cx  = df_all['Customer_Max']
+    um  = df_all['Unit_Min']
+    ux  = df_all['Unit_Max']
+    lb_date = df_all['Lookback Date']
 
-    # ── STEP 13: Bridge Classification (Node 936) ─────────────────────
-    # Strict if/elseif order exactly as in workflow XML.
-    # Granularity remapping applied AFTER classification to handle N/A dimensions.
-    def classify(row):
-        prior    = row['Prior MRR New']
-        curr     = row['MRR New']
-        past     = row['pastMRR New']
-        future   = row['futureMRR New']
-        dte      = row['DTE New']
-        lb       = int(row['Month Lookback'])
-        date     = row['Date New']
-        lb_start = (pd.Timestamp(date) - pd.DateOffset(months=lb)) + MonthEnd(0)
+    # ENTRY branch conditions (Prior=0, Current>0)
+    entry         = (pr == 0) & (cur > 0)
+    past_no       = ~pm                          # unit appeared within current lookback window
+    past_yes      = pm                           # unit existed before lookback window
 
-        if prior == 0 and curr != 0 and past == 'No':
-            if pd.Timestamp(row['CustProd_Min_Date']) <= lb_start:
-                return 'Other In'
-            elif pd.Timestamp(row['Customer Min Date New']) <= lb_start:
-                return 'Cross-sell'
-            else:
-                return 'New Logo'
-        elif prior == 0 and curr != 0 and past == 'Yes':
-            return 'Returning'
-        elif prior != 0 and curr == 0 and dte != 0 and future == 'No':
-            if pd.Timestamp(row['CustProd_Max_Date']) >= pd.Timestamp(date):
-                return 'Other Out'
-            elif pd.Timestamp(row['Customer Max Date New']) >= pd.Timestamp(date):
-                return 'Churn-Partial'
-            else:
-                return 'Churn'
-        elif curr == 0 and future == 'Yes':
-            return 'Lapsed'
-        elif prior != 0 and curr != 0:
-            return 'Upsell' if prior <= curr else 'Downsell'
-        else:
-            return 'Unclassified'
+    # Classification per Alteryx Node 936 (exact order):
+    cond_other_in    = entry & past_no & (um <= lb_date)
+    cond_cross_sell  = entry & past_no & (um > lb_date) & (cm <= lb_date)
+    cond_new_logo    = entry & past_no & (um > lb_date) & (cm > lb_date)
+    cond_returning   = entry & past_yes
 
-    df_all['Bridge Flag']  = df_all.apply(classify, axis=1)
+    # EXIT branch (Prior>0, Current=0, DTE>0, no future revenue)
+    exit_base        = (pr > 0) & (cur == 0) & (dte > 0) & ~fm
+    cond_other_out   = exit_base & (ux >= d)
+    cond_churn_partial = exit_base & (ux < d) & (cx >= d)
+    cond_churn       = exit_base & (ux < d) & (cx < d)
 
-    # Apply granularity remapping — collapses impossible classifications
-    df_all['Bridge Flag'] = df_all['Bridge Flag'].apply(
-        lambda f: _remap_by_granularity(f, has_product, has_channel_or_region)
-    )
+    # Lapsed: Current=0, future revenue exists
+    cond_lapsed      = (cur == 0) & fm
 
-    df_all['Bridge Value'] = df_all['MRR New'] - df_all['Prior MRR New']
+    # Change branch (Prior>0, Current>0)
+    change           = (pr > 0) & (cur > 0)
+    cond_upsell      = change & (cur > pr)
+    cond_downsell    = change & (cur < pr)
+    # Prior == Current → Bridge Value = 0 → filtered at output ✓
 
-    # ── STEP 14: Price/Volume Decomposition (Nodes 938/958) ───────────
-    mask_pvd = df_all['Bridge Flag'].isin(['Upsell', 'Downsell'])
+    conditions = [
+        cond_other_in, cond_cross_sell, cond_new_logo, cond_returning,
+        cond_other_out, cond_churn_partial, cond_churn,
+        cond_lapsed, cond_upsell, cond_downsell,
+    ]
+    choices = [
+        'Other In', 'Cross-sell', 'New Logo', 'Returning',
+        'Other Out', 'Churn Partial', 'Churn',
+        'Lapsed', 'Upsell', 'Downsell',
+    ]
 
-    q   = df_all.loc[mask_pvd, 'Quantity New'].replace(0, np.nan)
-    pq  = df_all.loc[mask_pvd, 'Prior Quantity New'].replace(0, np.nan)
-    mrr = df_all.loc[mask_pvd, 'MRR New']
-    pmr = df_all.loc[mask_pvd, 'Prior MRR New']
+    df_all['Bridge Flag'] = np.select(conditions, choices, default='Unclassified')
 
-    p  = (mrr / q).fillna(0);  q  = q.fillna(0)
-    pp = (pmr / pq).fillna(0); pq = pq.fillna(0)
-
-    price_impact  = (p - pp) * np.minimum(q, pq)
-    volume_impact = (q - pq) * np.minimum(p, pp)
-    same_dir      = ((p > pp) & (q > pq)) | ((p < pp) & (q < pq))
-    pov           = np.where(same_dir, -((p - pp) * (q - pq)), 0)
-    pv_misc       = (mrr - pmr) - price_impact - volume_impact - pov
-    volume_impact_final = volume_impact + pv_misc
-
-    df_all['Price Impact']    = 0.0
-    df_all['Volume Impact']   = 0.0
-    df_all['Price on Volume'] = 0.0
-    df_all.loc[mask_pvd, 'Price Impact']    = price_impact.values
-    df_all.loc[mask_pvd, 'Volume Impact']   = volume_impact_final.values
-    df_all.loc[mask_pvd, 'Price on Volume'] = pov
-
-    # Lookback Date (Node 958)
-    df_all['Lookback Date'] = df_all.apply(
-        lambda r: (pd.Timestamp(r['Date New']) - pd.DateOffset(months=int(r['Month Lookback']))) + MonthEnd(0),
-        axis=1
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 9: Granularity remapping (vectorized)
+    # ══════════════════════════════════════════════════════════════════
+    df_all['Bridge Flag'] = df_all['Bridge Flag'].map(
+        lambda f: _remap(f, has_product, has_channel_or_region)
     )
 
-    # ── STEP 15: Build output rows (CrossTab→Transpose equivalent) ────
-    # Produces rows for: bridge movements + Beginning MRR + Ending MRR + PV rows
-    base = ['Customer New', 'Product New', 'Channel New', 'Region New',
-            'Vintage New', 'Date New', 'MRR New', 'Quantity New',
-            'Month Lookback', 'Lookback Date']
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 7: Bridge Value = Current - Prior
+    # ══════════════════════════════════════════════════════════════════
+    df_all['Bridge Value'] = df_all['Revenue'] - df_all['Prior Revenue']
 
-    def stack(src, cls_val_or_col, val_col, filter_nonzero=True):
-        sub = src.copy()
-        if filter_nonzero:
-            sub = sub[src[val_col] != 0]
+    # Price/Volume decomposition (for Upsell/Downsell when Quantity is meaningful)
+    mask_ud = df_all['Bridge Flag'].isin(['Upsell', 'Downsell'])
+    if mask_ud.any():
+        q   = df_all.loc[mask_ud, 'Quantity'].replace(0, np.nan)
+        pq  = df_all.loc[mask_ud, 'Prior Quantity'].replace(0, np.nan)
+        rev = df_all.loc[mask_ud, 'Revenue']
+        pre = df_all.loc[mask_ud, 'Prior Revenue']
+        p   = (rev / q).fillna(0);  q  = q.fillna(0)
+        pp  = (pre / pq).fillna(0); pq = pq.fillna(0)
+        pi  = (p - pp) * np.minimum(q, pq)
+        vi  = (q - pq) * np.minimum(p, pp)
+        same_dir = ((p > pp) & (q > pq)) | ((p < pp) & (q < pq))
+        pov = np.where(same_dir, -((p - pp) * (q - pq)), 0)
+        pv_misc = (rev - pre) - pi - vi - pov
+        df_all.loc[mask_ud, 'Price Impact']    = pi.values
+        df_all.loc[mask_ud, 'Volume Impact']   = (vi + pv_misc).values
+        df_all.loc[mask_ud, 'Price on Volume'] = pov
+    df_all[['Price Impact', 'Volume Impact', 'Price on Volume']] = \
+        df_all[['Price Impact', 'Volume Impact', 'Price on Volume']].fillna(0)
+
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 8: Build output rows
+    # Stack: movements + Beginning MRR + Ending MRR (+ PV rows if Qty provided)
+    # ══════════════════════════════════════════════════════════════════
+    base_cols = ['Customer', 'Product', 'Channel', 'Region', 'Vintage',
+                 'Date', 'Revenue', 'Quantity', 'Month Lookback', 'Lookback Date']
+
+    def make_rows(src: pd.DataFrame, cls: str, val_col: str) -> pd.DataFrame:
+        sub = src[src[val_col] != 0].copy()
         if sub.empty:
             return pd.DataFrame()
-        out = sub[base].copy()
-        out['Bridge Classification'] = sub[cls_val_or_col].values if cls_val_or_col in src.columns else cls_val_or_col
-        out['Bridge Value'] = sub[val_col].values
-        return out[base + ['Bridge Classification', 'Bridge Value']]
+        out = sub[base_cols].copy()
+        out['Bridge Classification'] = cls if cls not in src.columns else sub[cls].values
+        out['Bridge Value']          = sub[val_col].values
+        return out[base_cols + ['Bridge Classification', 'Bridge Value']]
 
     parts = [
-        stack(df_all,        'Bridge Flag',    'Bridge Value'),
-        stack(df_all,        'Beginning MRR',  'Prior MRR New'),   # anchor rows
-        stack(df_all,        'Ending MRR',     'MRR New'),         # anchor rows
-        stack(df_all[mask_pvd], 'Price Impact',    'Price Impact'),
-        stack(df_all[mask_pvd], 'Volume Impact',   'Volume Impact'),
-        stack(df_all[mask_pvd], 'Price on Volume', 'Price on Volume'),
+        make_rows(df_all,           'Bridge Flag',    'Bridge Value'),
+        make_rows(df_all,           'Beginning MRR',  'Prior Revenue'),
+        make_rows(df_all,           'Ending MRR',     'Revenue'),
     ]
+    # Include Price/Volume rows only when Quantity is real data (not default=1)
+    if quantity_col and quantity_col in df_raw.columns and mask_ud.any():
+        parts += [
+            make_rows(df_all[mask_ud], 'Price Impact',    'Price Impact'),
+            make_rows(df_all[mask_ud], 'Volume Impact',   'Volume Impact'),
+            make_rows(df_all[mask_ud], 'Price on Volume', 'Price on Volume'),
+        ]
+
     parts = [p for p in parts if not p.empty]
     if not parts:
         return pd.DataFrame()
 
     df_out = pd.concat(parts, ignore_index=True)
-    # Keep non-zero Bridge Values (but Beginning/Ending can stay even if 0 for that row)
+    # Drop zero Bridge Values (Prior==Current produces BV=0 → correctly dropped here)
     df_out = df_out[df_out['Bridge Value'] != 0].copy()
 
-    # ── STEP 16: Final rename — exact Alteryx Node 944 column names ───
-    df_output = df_out.rename(columns={
-        'Customer New':  'Customer',
-        'Product New':   'Product',
-        'Channel New':   'Channel',
-        'Region New':    'Region',
-        'Vintage New':   'Vintage',
-        'Date New':      'Date',
-        'MRR New':       'MRR or ARR',     # matches Alteryx output exactly
-        'Quantity New':  'Quantity',
-    })[['Customer', 'Product', 'Channel', 'Region', 'Vintage',
+    # ══════════════════════════════════════════════════════════════════
+    # STEP 10: Final rename → exact 12-column output contract
+    # 'MRR or ARR' matches Alteryx Node 944 output + config.py rename map
+    # ══════════════════════════════════════════════════════════════════
+    df_out = df_out.rename(columns={'Revenue': 'MRR or ARR'})
+
+    df_out['Vintage'] = pd.to_datetime(df_out['Vintage']).dt.year.astype(str)
+
+    return df_out[[
+        'Customer', 'Product', 'Channel', 'Region', 'Vintage',
         'Date', 'MRR or ARR', 'Quantity', 'Month Lookback', 'Lookback Date',
-        'Bridge Classification', 'Bridge Value']]
-
-    df_output['Vintage'] = pd.to_datetime(df_output['Vintage']).dt.year.astype(str)
-
-    return df_output.reset_index(drop=True)
+        'Bridge Classification', 'Bridge Value',
+    ]].reset_index(drop=True)

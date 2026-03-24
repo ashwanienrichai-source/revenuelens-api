@@ -281,24 +281,54 @@ async def analyze_mrr_raw(
         }
     }
 
-    # Standard bridge analytics
-    df_filtered = filter_bridge_df(df_internal)
-    results['bridge']        = {str(lb): get_bridge_summary(df_filtered, dims, lb, yr, period_type) for lb in lbs}
-    results['fy_summary']    = get_fy_summary(df_filtered, 'Customer_ID', lbs[-1] if lbs else 12)
-    results['top_movers']    = get_top_movers(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, n_movers, year_filter=yr, period_type=period_type)
-    results['top_customers'] = get_top_customers(df_filtered, 'Customer_ID', dims[:2], lbs[-1] if lbs else 12, n_customers, period_type=period_type, year_filter=yr)
-    results['kpi_matrix']    = get_kpi_matrix(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, period_type)
-    results['output']        = df_filtered.head(1000).replace({np.nan: None}).to_dict(orient='records')
+    # Standard bridge analytics — each step wrapped independently
+    try:
+        df_filtered = filter_bridge_df(df_internal)
+    except Exception as e:
+        raise HTTPException(500, f'filter_bridge_df failed: {str(e)}')
 
-    # New pivot-table format (matches Excel output exactly)
-    results['pivot'] = build_full_bridge_response(
-        df             = df_internal,
-        customer_col   = 'Customer_ID',
-        lookbacks      = lbs,
-        period_type    = period_type,
-        dimension_cols = dims,
-        year_filter    = yr,
-    )
+    try:
+        results['bridge'] = {str(lb): get_bridge_summary(df_filtered, dims, lb, yr, period_type) for lb in lbs}
+    except Exception as e:
+        raise HTTPException(500, f'get_bridge_summary failed: {str(e)}')
+
+    try:
+        results['fy_summary'] = get_fy_summary(df_filtered, 'Customer_ID', lbs[-1] if lbs else 12)
+    except Exception as e:
+        results['fy_summary'] = []
+
+    try:
+        results['top_movers'] = get_top_movers(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, n_movers, year_filter=yr, period_type=period_type)
+    except Exception as e:
+        results['top_movers'] = {}
+
+    try:
+        results['top_customers'] = get_top_customers(df_filtered, 'Customer_ID', dims[:2], lbs[-1] if lbs else 12, n_customers, period_type=period_type, year_filter=yr)
+    except Exception as e:
+        results['top_customers'] = []
+
+    try:
+        results['kpi_matrix'] = get_kpi_matrix(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, period_type)
+    except Exception as e:
+        results['kpi_matrix'] = []
+
+    try:
+        results['output'] = df_filtered.head(1000).replace({np.nan: None}).to_dict(orient='records')
+    except Exception as e:
+        results['output'] = []
+
+    # Pivot-table format (matches Excel output exactly)
+    try:
+        results['pivot'] = build_full_bridge_response(
+            df             = df_internal,
+            customer_col   = 'Customer_ID',
+            lookbacks      = lbs,
+            period_type    = period_type,
+            dimension_cols = dims,
+            year_filter    = yr,
+        )
+    except Exception as e:
+        raise HTTPException(500, f'build_full_bridge_response failed: {str(e)}')
 
     return clean_json(results)
 

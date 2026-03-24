@@ -29,7 +29,7 @@ def _remap_by_granularity(flag: str, has_product: bool, has_channel_or_region: b
     """Same granularity remapping as MRR engine."""
     if not has_product:
         return {'Cross-sell': 'New Logo', 'Other In': 'Returning',
-                'Other Out': 'Churn', 'Churn-Partial': 'Churn'}.get(flag, flag)
+                'Other Out': 'Churn', 'Churn Partial': 'Churn'}.get(flag, flag)
     if not has_channel_or_region:
         return {'Other In': 'Returning', 'Other Out': 'Churn'}.get(flag, flag)
     return flag
@@ -248,7 +248,7 @@ def run_acv_workflow(
             if pd.Timestamp(row['CustProd_Max_Date']) >= pd.Timestamp(date):
                 return 'Other Out'
             elif pd.Timestamp(row['Customer Max Date New']) >= pd.Timestamp(date):
-                return 'Churn-Partial'
+                return 'Churn Partial'
             else:
                 return 'Churn'
         elif curr == 0 and future == 'Yes':

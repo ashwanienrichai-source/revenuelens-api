@@ -43,7 +43,7 @@ BRIDGE_COLORS = {
     'Add-on':         '#8B5CF6',
     'Churn':          '#EF4444',
     'Churn Partial':  '#FCA5A5',
-    'Churn-Partial':  '#FCA5A5',
+    'Churn Partial':  '#FCA5A5',
     'Other Out':      '#94A3B8',
     'Lapsed':         '#CBD5E1',
     'Beginning MRR':  '#1E3A5F',
@@ -211,7 +211,7 @@ def get_bridge_summary(
     # ── Retention metrics ─────────────────────────────────────────────
     BEG_CLASSES = {'Beginning MRR', 'Prior ACV', 'Beginning MRR or ARR', 'Beginning ARR'}
     END_CLASSES = {'Ending MRR', 'Ending ACV', 'Ending MRR or ARR', 'Ending ARR'}
-    CHURN_CLASSES = {'Churn', 'Churn Partial', 'Churn-Partial'}
+    CHURN_CLASSES = {'Churn', 'Churn Partial', 'Churn Partial'}
     beg = float(sub[sub['Classification'].isin(BEG_CLASSES)]['amount'].sum())
     ch  = float(sub[sub['Classification'].isin(CHURN_CLASSES)]['amount'].sum())
     dw  = float(sub[sub['Classification'] == 'Downsell']['amount'].sum())
@@ -379,7 +379,7 @@ def get_kpi_matrix(
     rows = []
     for _, row in pivot.iterrows():
         beg = row.get('Beginning MRR', row.get('Prior ACV', row.get('Beginning MRR or ARR', 0))) or 0
-        ch  = row.get('Churn', 0) + row.get('Churn Partial', 0) + row.get('Churn-Partial', 0)
+        ch  = row.get('Churn', 0) + row.get('Churn Partial', 0) + row.get('Churn Partial', 0)
         dw  = row.get('Downsell', 0)
         up  = row.get('Upsell', 0)
         cr  = row.get('Cross-sell', 0)
@@ -412,7 +412,7 @@ def get_kpi_matrix(
             entry['end_customers'] = int(sub_period[sub_period['Classification'].isin(
                 ['Ending MRR', 'Ending ACV'])][customer_col].nunique())
             entry['churn_customers'] = int(sub_period[sub_period['Classification'].isin(
-                ['Churn', 'Churn Partial', 'Churn-Partial'])][customer_col].nunique())
+                ['Churn', 'Churn Partial', 'Churn Partial'])][customer_col].nunique())
             entry['new_customers'] = int(sub_period[sub_period['Classification'] == 'New Logo'][customer_col].nunique())
 
         rows.append(entry)
@@ -542,7 +542,7 @@ def compute_mrr_bridge_from_raw(
             (p!=0)&(cur!=0)&(p<=cur),
             (p!=0)&(cur!=0)&(p>cur),
         ]
-        choices = ['Other In','Cross-sell','New Logo','Returning','Churn-Partial','Churn','Lapsed','Upsell','Downsell']
+        choices = ['Other In','Cross-sell','New Logo','Returning','Churn Partial','Churn','Lapsed','Upsell','Downsell']
         t['Classification'] = np.select(conditions, choices, default='Unclassified')
         t['Bridge_Value']   = cur - p
         t['Beginning MRR']  = p

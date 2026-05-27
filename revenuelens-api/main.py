@@ -9,6 +9,9 @@ import pandas as pd
 import numpy as np
 import io
 import json
+import httpx
+import os
+from typing import Optional, List
 
 from services.mrr_bridge_service import (
     load_bridge_file, filter_bridge_df, get_bridge_summary,
@@ -20,8 +23,19 @@ from services.mrr_workflow_engine import run_mrr_workflow
 from services.acv_workflow_engine import run_acv_workflow
 
 app = FastAPI(title="RevenueLens API", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
-                   allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://revenuelens.ashwaniandcompany.com",
+        "https://revenuelens-seven.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "*",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def load_df(file: UploadFile) -> pd.DataFrame:
@@ -62,7 +76,8 @@ async def detect_columns(file: UploadFile = File(...)):
     preview = df.head(5).replace({np.nan: None}).to_dict(orient='records')
     cols_lower = [c.lower() for c in df.columns]
     is_bridge = any(k in cols_lower for k in ['bridge value', 'classification', 'bridge classification', 'month lookback'])
-    is_acv = any(k in cols_lower for k in ['tcv','acv','contract_end','contract end','contractend']) or              any('contract' in c and ('end' in c or 'start' in c) for c in cols_lower)
+    is_acv = any(k in cols_lower for k in ['tcv','acv','contract_end','contract end','contractend']) or \
+             any('contract' in c and ('end' in c or 'start' in c) for c in cols_lower)
     return clean_json({'columns': df.columns.tolist(), 'row_count': len(df),
                        'preview': preview, 'is_bridge_output': is_bridge, 'is_acv': is_acv})
 
@@ -125,7 +140,6 @@ async def analyze_bridge(
     if 'output' in mods:
         results['output'] = df_filtered.head(1000).replace({np.nan: None}).to_dict(orient='records')
 
-    # Add new pivot-table format response
     results['pivot'] = build_full_bridge_response(
         df=df_filtered,
         customer_col=customer_col,
@@ -182,6 +196,7 @@ async def cohort_analyze(
 
     return clean_json(result)
 
+
 @app.post('/api/mrr/analyze')
 async def analyze_mrr_raw(
     file:           UploadFile = File(...),
@@ -201,18 +216,12 @@ async def analyze_mrr_raw(
     n_customers:    int = Form(10),
     tool_type:      str = Form('MRR'),
 ):
-    """
-    Run the full MRR Workflow engine on raw data.
-    Exact Python replication of MRR_Workflow_Advanced.yxmd.
-    Produces bridge output identical to Alteryx CSV, then runs all analytics.
-    """
     df_raw = load_df(file)
     df_raw.columns = df_raw.columns.str.strip()
 
     lbs  = json.loads(lookbacks)
     dims = [d for d in json.loads(dimension_cols) if d in df_raw.columns]
 
-    # Case-insensitive column matching for required columns
     col_lower = {c.lower().replace(' ','_'): c for c in df_raw.columns}
     def find_col(target, fallbacks=[]):
         candidates = [target] + fallbacks
@@ -232,7 +241,6 @@ async def analyze_mrr_raw(
             raise HTTPException(400, f"Column '{col}' not found. Available: {list(df_raw.columns)}")
 
     try:
-        # Run the Alteryx workflow equivalent
         df_bridge = run_mrr_workflow(
             df_raw        = df_raw,
             customer_col  = customer_col,
@@ -251,10 +259,6 @@ async def analyze_mrr_raw(
     if df_bridge.empty:
         raise HTTPException(400, 'No output after MRR workflow. Check date and revenue columns.')
 
-    # Rename to internal convention for bridge service
-    # Output cols: Customer, Product, Channel, Region, Vintage, Date,
-    #              MRR or ARR, Quantity, Month Lookback, Lookback Date,
-    #              Bridge Classification, Bridge Value
     df_internal = df_bridge.rename(columns={
         'Customer':              'Customer_ID',
         'Date':                  'Activity_Date',
@@ -281,7 +285,6 @@ async def analyze_mrr_raw(
         }
     }
 
-    # Standard bridge analytics — each step wrapped independently
     try:
         df_filtered = filter_bridge_df(df_internal)
     except Exception as e:
@@ -317,7 +320,6 @@ async def analyze_mrr_raw(
     except Exception as e:
         results['output'] = []
 
-    # Pivot-table format (matches Excel output exactly)
     try:
         results['pivot'] = build_full_bridge_response(
             df             = df_internal,
@@ -331,6 +333,7 @@ async def analyze_mrr_raw(
         raise HTTPException(500, f'build_full_bridge_response failed: {str(e)}')
 
     return clean_json(results)
+
 
 @app.post('/api/acv/analyze')
 async def analyze_acv_raw(
@@ -352,17 +355,12 @@ async def analyze_acv_raw(
     n_movers:         int = Form(30),
     n_customers:      int = Form(10),
 ):
-    """
-    Run the full ACV workflow engine on raw contract/booking data.
-    Produces bridge table, ACV table, and bookings table.
-    """
     df_raw = load_df(file)
     df_raw.columns = df_raw.columns.str.strip()
 
     lbs  = json.loads(lookbacks)
     dims = [d for d in json.loads(dimension_cols) if d in df_raw.columns]
 
-    # Case-insensitive column matching
     col_lower = {c.lower().replace(' ', '_'): c for c in df_raw.columns}
     def find_col(target, fallbacks=[]):
         for c in [target] + fallbacks:
@@ -403,10 +401,6 @@ async def analyze_acv_raw(
     if df_bridge.empty:
         raise HTTPException(400, 'No output after ACV workflow. Check contract start/end and TCV columns.')
 
-    # Rename to internal convention
-    # ACV output cols: Customer, Product, Channel, Region, Vintage, Date,
-    #                  ACV New, Quantity, Month Lookback, DTE New,
-    #                  Bridge Classification, Bridge Value
     df_internal = df_bridge.rename(columns={
         'Customer':              'Customer_ID',
         'Date':                  'Activity_Date',
@@ -434,7 +428,6 @@ async def analyze_acv_raw(
         }
     }
 
-    # Bridge analytics using existing service (works for both MRR and ACV)
     df_filtered = filter_bridge_df(df_internal)
     results['bridge']        = {str(lb): get_bridge_summary(df_filtered, dims, lb, yr, period_type) for lb in lbs}
     results['fy_summary']    = get_fy_summary(df_filtered, 'Customer_ID', lbs[-1] if lbs else 12)
@@ -442,12 +435,8 @@ async def analyze_acv_raw(
     results['top_customers'] = get_top_customers(df_filtered, 'Customer_ID', dims[:2], lbs[-1] if lbs else 12, n_customers, period_type=period_type, year_filter=yr)
     results['kpi_matrix']    = get_kpi_matrix(df_filtered, 'Customer_ID', dims, lbs[-1] if lbs else 12, period_type)
     results['output']        = df_filtered.head(1000).replace({np.nan: None}).to_dict(orient='records')
-
-    # ACV-specific tables
     results['acv_table']     = result['acv'].head(500).replace({np.nan: None}).to_dict(orient='records')
     results['bookings']      = result['bookings'].head(500).replace({np.nan: None}).to_dict(orient='records')
-
-    # Pivot tables
     results['pivot'] = build_full_bridge_response(
         df             = df_internal,
         customer_col   = 'Customer_ID',
@@ -458,3 +447,83 @@ async def analyze_acv_raw(
     )
 
     return clean_json(results)
+
+
+# ── AI Chat ───────────────────────────────────────────────────────────────────
+from pydantic import BaseModel as PydanticBase
+
+class ChatMessage(PydanticBase):
+    role: str
+    content: str
+
+class ChatRequest(PydanticBase):
+    message: str
+    mode: str = "consultant"
+    context: Optional[dict] = None
+    history: Optional[List[ChatMessage]] = []
+
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+def build_system_prompt(mode: str, context: Optional[dict]) -> str:
+    base = """You are RevenueLens AI — an elite revenue intelligence system for CFOs and revenue leaders.
+You have deep SaaS expertise: ARR, NRR, GRR, cohorts, waterfall analysis.
+Always ground answers in provided revenue data. Never make up numbers.
+Be precise, executive-ready, and actionable."""
+
+    ctx = ""
+    if context:
+        lines = [f"{k}: {v}" for k, v in context.items() if v is not None]
+        if lines:
+            ctx = "\n\nLIVE REVENUE DATA:\n" + "\n".join(lines)
+
+    modes = {
+        "consultant": f"{base}{ctx}\n\nAnswer questions using the revenue data. Be direct and data-backed.",
+        "insights":   f"{base}{ctx}\n\nGenerate executive narrative: what moved, why, business impact, risks, opportunities.",
+        "educator":   f"{base}{ctx}\n\nExplain SaaS metrics in plain English, connected to the user's own data.",
+        "advisor":    f"{base}{ctx}\n\nIdentify top 3 actions, upsell opportunities, churn risks, and strategic recommendations.",
+    }
+    return modes.get(mode, modes["consultant"])
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    system_prompt = build_system_prompt(req.mode, req.context)
+    history = [{"role": m.role, "content": m.content} for m in (req.history or [])]
+
+    # Try Groq first
+    if GROQ_API_KEY:
+        try:
+            msgs = [{"role": "system", "content": system_prompt}]
+            msgs += history[-6:]
+            msgs.append({"role": "user", "content": req.message})
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": "llama-3.3-70b-versatile", "messages": msgs, "max_tokens": 1024, "temperature": 0.3}
+                )
+                r.raise_for_status()
+                return {"response": r.json()["choices"][0]["message"]["content"], "provider": "groq", "mode": req.mode}
+        except Exception as e:
+            print(f"Groq failed: {e}")
+
+    # Fallback to Gemini
+    if GEMINI_API_KEY:
+        try:
+            contents = history[-6:] + [{"role": "user", "parts": [{"text": req.message}]}]
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+                    json={
+                        "system_instruction": {"parts": [{"text": system_prompt}]},
+                        "contents": contents,
+                        "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.3}
+                    }
+                )
+                r.raise_for_status()
+                return {"response": r.json()["candidates"][0]["content"]["parts"][0]["text"], "provider": "gemini", "mode": req.mode}
+        except Exception as e:
+            raise HTTPException(500, f"All providers failed: {e}")
+
+    raise HTTPException(500, "No AI provider configured")

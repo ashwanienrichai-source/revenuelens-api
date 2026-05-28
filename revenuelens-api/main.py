@@ -3,7 +3,7 @@ RevenueLens API v2 - Production Grade
 Modular analytics engine — run only selected modules.
 Preserves all existing cohort engine logic unchanged.
 """
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
@@ -11,7 +11,9 @@ import io
 import json
 import httpx
 import os
+import stripe
 from typing import Optional, List
+from pydantic import BaseModel
 
 from services.mrr_bridge_service import (
     load_bridge_file, filter_bridge_df, get_bridge_summary,
@@ -37,6 +39,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Stripe config ─────────────────────────────────────────────────────────────
+stripe.api_key            = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET     = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID           = os.getenv("STRIPE_PRICE_ID", "")
+FRONTEND_URL              = os.getenv("FRONTEND_URL", "https://revenuelens.ashwaniandcompany.com")
+SUPABASE_URL              = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY      = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+PLAN_PRICES = {
+    "pro":        os.getenv("STRIPE_PRICE_ID", ""),
+    "growth":     os.getenv("STRIPE_PRICE_ID_GROWTH", ""),
+    "enterprise": os.getenv("STRIPE_PRICE_ID_ENTERPRISE", ""),
+}
+
 
 def load_df(file: UploadFile) -> pd.DataFrame:
     content = file.file.read()
@@ -60,6 +76,42 @@ def clean_json(obj):
     if isinstance(obj, pd.Timestamp): return str(obj)[:10]
     if isinstance(obj, pd.Period):    return str(obj)
     return obj
+
+
+async def update_supabase_subscription(user_id: str, data: dict):
+    """Update Supabase profile via REST API (no supabase-py dependency needed)."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not user_id:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
+        headers = {
+            "apikey":        SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type":  "application/json",
+            "Prefer":        "return=minimal",
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.patch(url, headers=headers, json=data)
+    except Exception as e:
+        print(f"[Stripe] Supabase update failed: {e}")
+
+
+async def update_supabase_by_customer(stripe_customer_id: str, data: dict):
+    """Update Supabase profile by stripe_customer_id."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not stripe_customer_id:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/profiles?stripe_customer_id=eq.{stripe_customer_id}"
+        headers = {
+            "apikey":        SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type":  "application/json",
+            "Prefer":        "return=minimal",
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.patch(url, headers=headers, json=data)
+    except Exception as e:
+        print(f"[Stripe] Supabase customer update failed: {e}")
 
 
 @app.get('/')
@@ -152,7 +204,6 @@ async def analyze_bridge(
     return clean_json(results)
 
 
-# ── Cohort endpoints — backward compatible, unchanged logic ────────────
 @app.post('/api/cohort/columns')
 async def cohort_columns(file: UploadFile = File(...)):
     return await detect_columns(file)
@@ -450,13 +501,11 @@ async def analyze_acv_raw(
 
 
 # ── AI Chat ───────────────────────────────────────────────────────────────────
-from pydantic import BaseModel as PydanticBase
-
-class ChatMessage(PydanticBase):
+class ChatMessage(BaseModel):
     role: str
     content: str
 
-class ChatRequest(PydanticBase):
+class ChatRequest(BaseModel):
     message: str
     mode: str = "consultant"
     context: Optional[dict] = None
@@ -491,7 +540,6 @@ async def chat(req: ChatRequest):
     system_prompt = build_system_prompt(req.mode, req.context)
     history = [{"role": m.role, "content": m.content} for m in (req.history or [])]
 
-    # Try Groq first
     if GROQ_API_KEY:
         try:
             msgs = [{"role": "system", "content": system_prompt}]
@@ -508,7 +556,6 @@ async def chat(req: ChatRequest):
         except Exception as e:
             print(f"Groq failed: {e}")
 
-    # Fallback to Gemini
     if GEMINI_API_KEY:
         try:
             contents = history[-6:] + [{"role": "user", "parts": [{"text": req.message}]}]
@@ -527,3 +574,93 @@ async def chat(req: ChatRequest):
             raise HTTPException(500, f"All providers failed: {e}")
 
     raise HTTPException(500, "No AI provider configured")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STRIPE PAYMENTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CheckoutRequest(BaseModel):
+    user_id:    str
+    user_email: str
+    plan:       str = "pro"
+
+
+@app.post("/api/stripe/create-checkout")
+async def create_checkout(req: CheckoutRequest):
+    price_id = PLAN_PRICES.get(req.plan) or STRIPE_PRICE_ID
+    if not price_id:
+        raise HTTPException(status_code=500, detail="Stripe price not configured")
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            customer_email=req.user_email,
+            client_reference_id=req.user_id,
+            metadata={"user_id": req.user_id, "plan": req.plan},
+            success_url=f"{FRONTEND_URL}/dashboard/upgrade?success=true&session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_URL}/dashboard/upgrade?cancelled=true",
+        )
+        return {"url": session.url, "session_id": session.id}
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig     = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if event["type"] == "checkout.session.completed":
+        session               = event["data"]["object"]
+        user_id               = session.get("client_reference_id") or session.get("metadata", {}).get("user_id")
+        plan                  = session.get("metadata", {}).get("plan", "pro")
+        stripe_customer_id    = session.get("customer")
+        stripe_subscription_id = session.get("subscription")
+        if user_id:
+            await update_supabase_subscription(user_id, {
+                "subscription_status":    "pro",
+                "stripe_customer_id":     stripe_customer_id,
+                "stripe_subscription_id": stripe_subscription_id,
+                "plan":                   plan,
+            })
+
+    elif event["type"] == "customer.subscription.deleted":
+        sub                = event["data"]["object"]
+        stripe_customer_id = sub.get("customer")
+        if stripe_customer_id:
+            await update_supabase_by_customer(stripe_customer_id, {
+                "subscription_status": "free",
+                "plan":                "free",
+            })
+
+    return {"received": True}
+
+
+@app.get("/api/stripe/subscription-status")
+async def subscription_status(user_id: str):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return {"status": "unknown"}
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=subscription_status,plan"
+        headers = {
+            "apikey":        SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url, headers=headers)
+            data = r.json()
+            if data:
+                return {"status": data[0].get("subscription_status", "free"), "plan": data[0].get("plan", "free")}
+            return {"status": "free", "plan": "free"}
+    except Exception as e:
+        return {"status": "free", "error": str(e)}

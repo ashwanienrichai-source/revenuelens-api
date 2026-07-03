@@ -152,6 +152,10 @@ def run_acv_workflow(
 ) -> dict:
     """
     Generic reusable ACV engine. Works on any contract dataset.
+
+    In-Scope Rule (Alteryx 2.2 Formula — applied automatically, no user config needed):
+      Out of Scope if: Start > End  OR  TCV <= 0  OR  (TCV > 0 AND Quantity <= 0)
+      In Scope  if:  all conditions pass
     Returns: { 'bridge': DataFrame, 'acv': DataFrame, 'bookings': DataFrame, 'qc': dict }
     """
 
@@ -164,8 +168,10 @@ def run_acv_workflow(
     df['Start']     = pd.to_datetime(df_raw[start_col],  errors='coerce')
     df['End']       = pd.to_datetime(df_raw[end_col],    errors='coerce')
     df['TCV']       = pd.to_numeric(df_raw[tcv_col],     errors='coerce').fillna(0.0)
-    df['Qty']       = pd.to_numeric(df_raw[quantity_col], errors='coerce').fillna(1.0) \
-                      if quantity_col and quantity_col in df_raw.columns else 1.0
+    df['Qty']       = pd.to_numeric(df_raw[quantity_col], errors='coerce').fillna(0.0) \
+                      if quantity_col and quantity_col in df_raw.columns else 0.0
+    # NOTE: 0.0 default is intentional — enables Alteryx scope condition 3 (TCV>0 AND Qty<=0)
+    # P×V decomposition only runs when has_quantity=True (quantity_col was explicitly provided)
     df['OrderDate'] = pd.to_datetime(df_raw[order_date_col], errors='coerce') \
                       if order_date_col and order_date_col in df_raw.columns else pd.NaT
 
@@ -181,11 +187,17 @@ def run_acv_workflow(
     )
 
     # ── STEP 3: In-scope filter ───────────────────────────────────────────────
-    df['InScope'] = True
-    df.loc[df['Start'] > df['End'], 'InScope'] = False
-    df.loc[df['TCV'] <= 0, 'InScope']          = False
-    if has_quantity:
-        df.loc[(df['TCV'] > 0) & (df['Qty'] <= 0), 'InScope'] = False
+    # ── In-Scope Rule (Alteryx 2.2 Formula — exact replication) ─────────────
+    # Out of Scope if:
+    #   1. Contract Start Date > Contract End Date
+    #   2. TCV <= 0
+    #   3. TCV > 0 AND Quantity <= 0  (quantity-bearing contracts with invalid qty)
+    # This is applied unconditionally — it is not user-configurable
+    cond_start_after_end = df['Start'] > df['End']
+    cond_tcv_zero        = df['TCV'] <= 0
+    cond_qty_invalid     = (df['TCV'] > 0) & (df['Qty'] <= 0) & has_quantity
+
+    df['InScope'] = ~(cond_start_after_end | cond_tcv_zero | cond_qty_invalid)
 
     bookings = df.copy()
 

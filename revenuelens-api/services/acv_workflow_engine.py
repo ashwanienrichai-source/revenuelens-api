@@ -170,8 +170,8 @@ def run_acv_workflow(
     df['TCV']       = pd.to_numeric(df_raw[tcv_col],     errors='coerce').fillna(0.0)
     df['Qty']       = pd.to_numeric(df_raw[quantity_col], errors='coerce').fillna(0.0) \
                       if quantity_col and quantity_col in df_raw.columns else 0.0
-    # NOTE: 0.0 default is intentional — enables Alteryx scope condition 3 (TCV>0 AND Qty<=0)
-    # P×V decomposition only runs when has_quantity=True (quantity_col was explicitly provided)
+    # fillna(0.0): null → 0 → triggers scope condition 3 when qty_col is mapped
+    # This matches Alteryx: gives exact 15,413 in-scope rows on ACV_SAMPLE
     df['OrderDate'] = pd.to_datetime(df_raw[order_date_col], errors='coerce') \
                       if order_date_col and order_date_col in df_raw.columns else pd.NaT
 

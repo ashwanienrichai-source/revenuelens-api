@@ -9,6 +9,7 @@ OPTIONAL:   product_col, channel_col, region_col, quantity_col, order_date_col
 """
 
 import pandas as pd
+import gc
 import numpy as np
 from typing import Optional, List
 from pandas.tseries.offsets import MonthEnd
@@ -231,6 +232,7 @@ def run_acv_workflow(
 
     all_lb_parts = []
 
+    all_bridge_parts = []  # accumulate bridge rows across all lookbacks
     for lb in lookback_months:
         # Generate rows for every contract
         contract_rows = []
@@ -446,7 +448,12 @@ def run_acv_workflow(
     # Bridge Flag column reference fix
     parts[0]['Bridge Classification'] = df_all.loc[df_all['Bridge Value'] != 0, 'Bridge Flag'].values
 
-    bridge = pd.concat([p for p in parts if not p.empty], ignore_index=True)
+    # Accumulate and free memory between lookback iterations
+    all_bridge_parts.extend([p for p in parts if not p.empty])
+    del agg, dense, df_all, parts, contract_rows
+    gc.collect()
+
+    bridge = pd.concat([p for p in all_bridge_parts if not p.empty], ignore_index=True)
     bridge = bridge[bridge['Bridge Value'] != 0].copy()
 
     # Final column rename

@@ -170,15 +170,19 @@ def run_acv_workflow(
     df['TCV']       = pd.to_numeric(df_raw[tcv_col],     errors='coerce').fillna(0.0)
     df['Qty']       = pd.to_numeric(df_raw[quantity_col], errors='coerce').fillna(0.0) \
                       if quantity_col and quantity_col in df_raw.columns else 0.0
-    # fillna(0.0): null → 0 → triggers scope condition 3 when qty_col is mapped
-    # This matches Alteryx: gives exact 15,413 in-scope rows on ACV_SAMPLE
     df['OrderDate'] = pd.to_datetime(df_raw[order_date_col], errors='coerce') \
                       if order_date_col and order_date_col in df_raw.columns else pd.NaT
 
     has_product  = product_col  is not None and product_col  in df_raw.columns
     has_channel  = channel_col  is not None and channel_col  in df_raw.columns
     has_region   = region_col   is not None and region_col   in df_raw.columns
-    has_quantity = quantity_col is not None and quantity_col in df_raw.columns
+    # has_quantity: True only when qty col provided AND has at least some non-zero values
+    # This prevents false exclusion when synthetic CSV has qty=0 as a default
+    has_quantity = (
+        quantity_col is not None
+        and quantity_col in df_raw.columns
+        and (df['Qty'] > 0).any()  # at least one row has a real quantity value
+    )
 
     # ── STEP 2: ACV computation ───────────────────────────────────────────────
     df['ACV'] = df.apply(

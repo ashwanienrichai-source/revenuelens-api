@@ -472,11 +472,60 @@ def run_acv_workflow(
     # ── STEP 14: QC Checks ────────────────────────────────────────────────────
     qc = _run_qc(bridge, acv_table, has_quantity)
 
+    # ── Pre-aggregate bridge before returning ──────────────────────────────────
+    # Raw bridge (783K rows) = 786MB in memory when serialized → OOM on Render 512MB
+    # Pre-aggregated (1,516 rows) = 0.1MB → fits easily
+    # The UI only needs period-level and customer-level aggregations, not raw rows
+
+    # 1. Period-level aggregation (all UI tabs: Summary, Bridge, Historical, Rates, Cohort)
+    agg_cols = ['Date', 'Month Lookback', 'Bridge Classification', 'Vintage',
+                'Customer', 'Product', 'Channel', 'Region']
+    # Keep only lb=12 for the main response (lb=1,3 available on demand)
+    bridge_lb12 = bridge[bridge['Month Lookback'] == 12].copy()
+
+    # Period summary: sum bridge values by date × lookback × classification
+    period_summary = (
+        bridge_lb12
+        .groupby(['Date', 'Month Lookback', 'Bridge Classification'])['Bridge Value']
+        .sum()
+        .reset_index()
+    )
+
+    # Customer summary: for Top Movers and Account 360 — top 200 customers by abs movement
+    movement_cls = {CLS_CHURN, CLS_CHURN_P, CLS_UPSELL, CLS_DOWNSELL,
+                    CLS_NEW_LOGO, CLS_CROSS, CLS_ADDON, CLS_LAPSED, CLS_RET}
+    movements = bridge_lb12[bridge_lb12['Bridge Classification'].isin(movement_cls)]
+    top_custs = (
+        movements.groupby('Customer')['Bridge Value']
+        .apply(lambda x: x.abs().sum())
+        .nlargest(200)
+        .index.tolist()
+    )
+    customer_summary = (
+        bridge_lb12[bridge_lb12['Customer'].isin(top_custs)]
+        .groupby(['Customer', 'Product', 'Channel', 'Region', 'Date',
+                  'Bridge Classification', 'Vintage'])['Bridge Value']
+        .sum()
+        .reset_index()
+    )
+
+    # Convert dates to strings for JSON serialization
+    period_summary['Date'] = period_summary['Date'].astype(str)
+    customer_summary['Date'] = customer_summary['Date'].astype(str)
+    customer_summary['Vintage'] = customer_summary['Vintage'].astype(str)
+
+    del bridge, bridge_lb12, movements
+    gc.collect()
+
     return {
-        'bridge':   bridge,
-        'acv':      acv_table,
-        'bookings': bookings,
-        'qc':       qc,
+        'bridge':           period_summary.to_dict('records'),
+        'customer_bridge':  customer_summary.to_dict('records'),
+        'acv':              acv_table.to_dict('records') if not acv_table.empty else [],
+        'bookings':         bookings[['Customer','Product','Channel','Region',
+                                       'Start','End','TCV','ACV','InScope',
+                                       'OutOfScopeReason']].to_dict('records')
+                            if not bookings.empty else [],
+        'qc':               qc,
     }
 
 

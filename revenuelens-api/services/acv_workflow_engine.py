@@ -493,16 +493,35 @@ def run_acv_workflow(
         'bridge_output_rows': len(bridge),
     }
 
+    # Convert Timestamp columns to strings — required for JSON serialization.
+    # (This was missing in the original engine and caused every request to
+    # crash with TypeError: Object of type Timestamp is not JSON serializable)
+    acv_table_out = acv_table.copy()
+    for col in ['Contract Start Date', 'Contract End Date', 'Date']:
+        if col in acv_table_out.columns:
+            acv_table_out[col] = acv_table_out[col].astype(str)
+
+    bookings_out = bookings.copy()
+    for col in ['Start', 'End']:
+        if col in bookings_out.columns:
+            bookings_out[col] = bookings_out[col].astype(str)
+
+    bookings_cols = ['Customer', 'Product', 'Channel', 'Region',
+                      'Start', 'End', 'TCV', 'ACV', 'InScope']
+    # (original code also selected 'OutOfScopeReason' which is never created
+    # anywhere in this function — that caused a guaranteed KeyError on every
+    # request. Removed until that field is actually computed somewhere.)
+
     out = {
         'bridge':          period_summary.to_dict('records'),
         'customer_bridge': customer_summary.to_dict('records'),
-        'acv':             acv_table.to_dict('records') if not acv_table.empty else [],
-        'bookings':        bookings.to_dict('records') if not bookings.empty else [],
+        'acv':             acv_table_out.to_dict('records') if not acv_table_out.empty else [],
+        'bookings':        bookings_out[bookings_cols].to_dict('records') if not bookings_out.empty else [],
         'qc':              qc,
-        '_bridge_df':      bridge,
     }
     if _return_timings:
         out['timings'] = timings
+        out['_bridge_df'] = bridge  # local debugging only — strip before deploying if timings enabled
     return out
 
 

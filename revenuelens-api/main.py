@@ -97,9 +97,22 @@ def safe_json(obj):
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
-def df_to_records(df: pd.DataFrame) -> list:
-    """Convert DataFrame to JSON-safe list of dicts."""
-    if df is None or df.empty:
+def df_to_records(df) -> list:
+    """
+    Convert DataFrame to JSON-safe list of dicts.
+
+    FIX: some engines (e.g. the ACV pre-aggregation engine) now return
+    already-converted lists of dicts directly, instead of raw DataFrames.
+    This function is made tolerant of both shapes so it doesn't crash with
+    AttributeError: 'list' object has no attribute 'empty' when that happens.
+    """
+    if df is None:
+        return []
+    if isinstance(df, list):
+        # Already converted to records upstream (e.g. by run_acv_workflow) —
+        # pass through as-is.
+        return df
+    if df.empty:
         return []
     df = df.copy()
     for col in df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns:
@@ -239,19 +252,28 @@ async def analyze_acv(
             revenue_unit   = revenue_unit,
         )
 
-        bridge   = result.get("bridge",   pd.DataFrame())
-        acv_tbl  = result.get("acv",      pd.DataFrame())
-        bookings = result.get("bookings", pd.DataFrame())
-        qc       = result.get("qc",       {})
+        # IMPORTANT: run_acv_workflow already returns "bridge", "customer_bridge",
+        # "acv", and "bookings" as pre-aggregated LISTS of dicts (not raw
+        # DataFrames) — this is part of the OOM fix (period/customer summaries
+        # computed inside the engine to avoid serializing the full raw bridge
+        # table). Do NOT pass these through df_to_records() as if they were
+        # DataFrames; df_to_records now tolerates both shapes defensively,
+        # but we also fetch them correctly here.
+        bridge          = result.get("bridge", [])
+        customer_bridge = result.get("customer_bridge", [])   # was missing from response entirely
+        acv_tbl         = result.get("acv", [])
+        bookings        = result.get("bookings", [])
+        qc              = result.get("qc", {})
 
         logger.info(f"/api/acv/analyze bridge_rows={len(bridge)} qc={qc}")
 
         return JSONResponse(content={
-            "bridge":    df_to_records(bridge),
-            "acv_table": df_to_records(acv_tbl),
-            "bookings":  df_to_records(bookings),
-            "qc":        qc,
-            "row_count": len(df),
+            "bridge":          df_to_records(bridge),
+            "customer_bridge": df_to_records(customer_bridge),
+            "acv_table":       df_to_records(acv_tbl),
+            "bookings":        df_to_records(bookings),
+            "qc":              qc,
+            "row_count":       len(df),
         })
     except Exception as e:
         logger.error(f"/api/acv/analyze error: {e}", exc_info=True)

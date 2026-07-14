@@ -469,15 +469,22 @@ def run_acv_workflow(
 
     qc = _run_qc(bridge, acv_table, has_quantity)
 
-    # ── Risk & Opportunity — computed on the FULL bridge, before any
-    # customer cutoff below, so no customer is silently excluded from
-    # scoring regardless of how many total customers there are.
+    # ── Risk & Opportunity — computed on the FULL bridge, for EVERY period
+    # (not one auto-picked snapshot), before any customer cutoff below, so
+    # no customer/period is silently excluded from scoring. Returns two
+    # DataFrames: risk_opp_summary (full population counts/ACV per period —
+    # never capped, used for header stats) and risk_opp_detail (top-N
+    # customers per period per side — capped to keep payload safe, same
+    # principle as customer_bridge's MAX_CUSTOMER_BRIDGE_ROWS cap).
     t0 = time.time()
-    risk_opp_df = compute_risk_opportunity(bridge, has_product=has_product)
-    if not risk_opp_df.empty:
-        risk_opp_df = risk_opp_df.copy()
-        risk_opp_df['Date'] = risk_opp_df['Date'].astype(str)
-    mark('STEP 14a - risk & opportunity scoring (full customer set)', t0)
+    risk_opp_summary, risk_opp_detail = compute_risk_opportunity(bridge, has_product=has_product, top_n=50)
+    if not risk_opp_summary.empty:
+        risk_opp_summary = risk_opp_summary.copy()
+        risk_opp_summary['Date'] = risk_opp_summary['Date'].astype(str)
+    if not risk_opp_detail.empty:
+        risk_opp_detail = risk_opp_detail.copy()
+        risk_opp_detail['Date'] = risk_opp_detail['Date'].astype(str)
+    mark('STEP 14a - risk & opportunity scoring (all periods, vectorized)', t0)
 
     # Pre-aggregate (BUG FIXED: CLS_RET -> CLS_RETURNING)
     t0 = time.time()
@@ -544,7 +551,8 @@ def run_acv_workflow(
         'acv':              (acv_table_out.to_dict('records') if not acv_table_out.empty else []) if include_acv_table else [],
         'bookings':         bookings_out[bookings_cols].to_dict('records') if not bookings_out.empty else [],
         'qc':               qc,
-        'risk_opportunity': risk_opp_df.to_dict('records') if not risk_opp_df.empty else [],
+        'risk_opportunity_summary': risk_opp_summary.to_dict('records') if not risk_opp_summary.empty else [],
+        'risk_opportunity_detail':  risk_opp_detail.to_dict('records')  if not risk_opp_detail.empty  else [],
     }
     if _return_timings:
         out['timings'] = timings

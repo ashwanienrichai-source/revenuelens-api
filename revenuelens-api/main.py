@@ -259,21 +259,23 @@ async def analyze_acv(
         # table). Do NOT pass these through df_to_records() as if they were
         # DataFrames; df_to_records now tolerates both shapes defensively,
         # but we also fetch them correctly here.
-        bridge          = result.get("bridge", [])
-        customer_bridge = result.get("customer_bridge", [])   # was missing from response entirely
-        acv_tbl         = result.get("acv", [])
-        bookings        = result.get("bookings", [])
-        qc              = result.get("qc", {})
+        bridge           = result.get("bridge", [])
+        customer_bridge  = result.get("customer_bridge", [])   # was missing from response entirely
+        acv_tbl          = result.get("acv", [])
+        bookings         = result.get("bookings", [])
+        qc               = result.get("qc", {})
+        risk_opportunity = result.get("risk_opportunity", [])   # deterministic churn risk / expansion scoring, full customer set
 
         logger.info(f"/api/acv/analyze bridge_rows={len(bridge)} qc={qc}")
 
         return JSONResponse(content={
-            "bridge":          df_to_records(bridge),
-            "customer_bridge": df_to_records(customer_bridge),
-            "acv_table":       df_to_records(acv_tbl),
-            "bookings":        df_to_records(bookings),
-            "qc":              qc,
-            "row_count":       len(df),
+            "bridge":           df_to_records(bridge),
+            "customer_bridge":  df_to_records(customer_bridge),
+            "acv_table":        df_to_records(acv_tbl),
+            "bookings":         df_to_records(bookings),
+            "qc":               qc,
+            "risk_opportunity": df_to_records(risk_opportunity),
+            "row_count":        len(df),
         })
     except Exception as e:
         logger.error(f"/api/acv/analyze error: {e}", exc_info=True)

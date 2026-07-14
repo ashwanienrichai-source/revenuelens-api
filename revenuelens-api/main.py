@@ -490,23 +490,30 @@ async def analyze_acv(
         # table). Do NOT pass these through df_to_records() as if they were
         # DataFrames; df_to_records now tolerates both shapes defensively,
         # but we also fetch them correctly here.
-        bridge           = result.get("bridge", [])
-        customer_bridge  = result.get("customer_bridge", [])   # was missing from response entirely
-        acv_tbl          = result.get("acv", [])
-        bookings         = result.get("bookings", [])
-        qc               = result.get("qc", {})
-        risk_opportunity = result.get("risk_opportunity", [])   # deterministic churn risk / expansion scoring, full customer set
+        bridge                   = result.get("bridge", [])
+        customer_bridge          = result.get("customer_bridge", [])   # was missing from response entirely
+        acv_tbl                  = result.get("acv", [])
+        bookings                 = result.get("bookings", [])
+        qc                       = result.get("qc", {})
+        # Risk & Opportunity now scored per-PERIOD (not one auto-picked
+        # snapshot). summary = full population counts/ACV per period, never
+        # capped — used for header stats. detail = top-N customers per
+        # period per side, capped to keep payload safe (same principle as
+        # customer_bridge's own cap).
+        risk_opportunity_summary = result.get("risk_opportunity_summary", [])
+        risk_opportunity_detail  = result.get("risk_opportunity_detail", [])
 
         logger.info(f"/api/acv/analyze bridge_rows={len(bridge)} qc={qc}")
 
         return JSONResponse(content={
-            "bridge":           df_to_records(bridge),
-            "customer_bridge":  df_to_records(customer_bridge),
-            "acv_table":        df_to_records(acv_tbl),
-            "bookings":         df_to_records(bookings),
-            "qc":               qc,
-            "risk_opportunity": df_to_records(risk_opportunity),
-            "row_count":        len(df),
+            "bridge":                   df_to_records(bridge),
+            "customer_bridge":          df_to_records(customer_bridge),
+            "acv_table":                df_to_records(acv_tbl),
+            "bookings":                 df_to_records(bookings),
+            "qc":                       qc,
+            "risk_opportunity_summary": df_to_records(risk_opportunity_summary),
+            "risk_opportunity_detail":  df_to_records(risk_opportunity_detail),
+            "row_count":                len(df),
         })
     except Exception as e:
         logger.error(f"/api/acv/analyze error: {e}", exc_info=True)

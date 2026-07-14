@@ -26,6 +26,21 @@ import time
 import numpy as np
 from typing import Optional, List
 from pandas.tseries.offsets import MonthEnd
+from risk_opportunity import compute_risk_opportunity
+
+# ── Payload size guardrail ─────────────────────────────────────────────────
+# customer_bridge (per-customer detail, used by Top Movers / Account 360 /
+# Cohort) is capped to the top N customers by absolute bridge movement, to
+# keep the JSON response small enough for Render's free-tier memory limit.
+# This is NOT a business-logic limit — every customer is still fully computed
+# above; this only controls how many get sent to the frontend by name.
+#
+# Raised from 200 -> 1500 (Jul 2026): your ground-truth dataset has 7,212
+# customers total, so 1500 covers the large majority of realistic client
+# datasets today with real headroom. If a client's dataset regularly exceeds
+# this, the right fix is server-side pagination + search, not just raising
+# this number further — see product discussion log.
+MAX_CUSTOMER_BRIDGE_ROWS = 1500
 
 CLS_NEW_LOGO  = 'New Logo'
 CLS_CROSS     = 'Cross-sell'
@@ -132,6 +147,7 @@ def run_acv_workflow(
     quantity_col: Optional[str] = None,
     lookback_months: List[int] = [12],
     revenue_unit: str = 'TCV',
+    include_acv_table: bool = False,
     _return_timings: bool = False,
 ) -> dict:
 
@@ -453,6 +469,16 @@ def run_acv_workflow(
 
     qc = _run_qc(bridge, acv_table, has_quantity)
 
+    # ── Risk & Opportunity — computed on the FULL bridge, before any
+    # customer cutoff below, so no customer is silently excluded from
+    # scoring regardless of how many total customers there are.
+    t0 = time.time()
+    risk_opp_df = compute_risk_opportunity(bridge, has_product=has_product)
+    if not risk_opp_df.empty:
+        risk_opp_df = risk_opp_df.copy()
+        risk_opp_df['Date'] = risk_opp_df['Date'].astype(str)
+    mark('STEP 14a - risk & opportunity scoring (full customer set)', t0)
+
     # Pre-aggregate (BUG FIXED: CLS_RET -> CLS_RETURNING)
     t0 = time.time()
     bridge_lb12 = bridge[bridge['Month Lookback'] == 12].copy() if 12 in lookback_months else bridge.copy()
@@ -470,7 +496,7 @@ def run_acv_workflow(
     top_custs = (
         movements.groupby('Customer')['Bridge Value']
         .apply(lambda x: x.abs().sum())
-        .nlargest(200)
+        .nlargest(MAX_CUSTOMER_BRIDGE_ROWS)
         .index.tolist()
     )
     customer_summary = (
@@ -513,11 +539,12 @@ def run_acv_workflow(
     # request. Removed until that field is actually computed somewhere.)
 
     out = {
-        'bridge':          period_summary.to_dict('records'),
-        'customer_bridge': customer_summary.to_dict('records'),
-        'acv':             acv_table_out.to_dict('records') if not acv_table_out.empty else [],
-        'bookings':        bookings_out[bookings_cols].to_dict('records') if not bookings_out.empty else [],
-        'qc':              qc,
+        'bridge':           period_summary.to_dict('records'),
+        'customer_bridge':  customer_summary.to_dict('records'),
+        'acv':              (acv_table_out.to_dict('records') if not acv_table_out.empty else []) if include_acv_table else [],
+        'bookings':         bookings_out[bookings_cols].to_dict('records') if not bookings_out.empty else [],
+        'qc':               qc,
+        'risk_opportunity': risk_opp_df.to_dict('records') if not risk_opp_df.empty else [],
     }
     if _return_timings:
         out['timings'] = timings

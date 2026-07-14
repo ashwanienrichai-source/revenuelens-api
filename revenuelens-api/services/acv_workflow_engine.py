@@ -26,7 +26,7 @@ import time
 import numpy as np
 from typing import Optional, List
 from pandas.tseries.offsets import MonthEnd
-from risk_opportunity import compute_risk_opportunity
+from services.risk_opportunity import compute_risk_opportunity
 
 # ── Payload size guardrail ─────────────────────────────────────────────────
 # customer_bridge (per-customer detail, used by Top Movers / Account 360 /

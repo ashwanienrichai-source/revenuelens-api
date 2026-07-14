@@ -171,45 +171,276 @@ async def get_columns(file: UploadFile = File(...)):
 
 # ── MRR / ARR Analytics ────────────────────────────────────────────────────────
 
+def compute_bridge_qc(loaded_df: pd.DataFrame) -> dict:
+    """
+    Structured (non-warning) reconciliation check on a bridge DataFrame that
+    has already been through load_bridge_file() — i.e. uses the internal
+    column names: Activity_Date, Month_Lookback, Classification, amount.
+
+    Mirrors mrr_workflow_engine._check_reconciliation's math, but returns a
+    dict the API can surface (parity with the ACV engine's qc1/qc1_detail).
+    """
+    if loaded_df is None or loaded_df.empty:
+        return {"qc1": False, "qc1_detail": "No bridge rows to check"}
+
+    BEG = {'Beginning MRR', 'Prior ACV', 'Beginning MRR or ARR', 'Beginning ARR'}
+    END = {'Ending MRR', 'Ending ACV', 'Ending MRR or ARR', 'Ending ARR'}
+    MOVEMENTS = {'New Logo', 'Cross-sell', 'Other In', 'Returning',
+                 'Upsell', 'Downsell', 'Churn', 'Churn Partial', 'Other Out', 'Lapsed'}
+
+    required = {'Activity_Date', 'Month_Lookback', 'Classification', 'amount'}
+    if not required.issubset(loaded_df.columns):
+        return {"qc1": True, "qc1_detail": "Reconciliation skipped — required columns not present"}
+
+    pivot = (loaded_df.groupby(['Activity_Date', 'Month_Lookback', 'Classification'])['amount']
+             .sum().unstack(fill_value=0))
+
+    beg_col = next((c for c in BEG if c in pivot.columns), None)
+    end_col = next((c for c in END if c in pivot.columns), None)
+    if not beg_col or not end_col:
+        return {"qc1": True, "qc1_detail": "Reconciliation skipped — no boundary rows found"}
+
+    mov_cols = [c for c in pivot.columns if c in MOVEMENTS]
+    diff = (pivot[beg_col] + pivot[mov_cols].sum(axis=1) - pivot[end_col]).abs()
+    bad = diff[diff > 0.01]
+
+    qc1 = len(bad) == 0
+    detail = ("All periods reconcile (±0.01)" if qc1
+              else f"{len(bad)} period(s) mismatch — max discrepancy {diff.max():.2f}")
+    return {"qc1": qc1, "qc1_detail": detail}
+
+
+def build_bridge_response(
+    loaded_df:      pd.DataFrame,
+    customer_col:   str,
+    dimension_cols: list,
+    lookbacks:      list,
+    year_filter,
+    period_type:    str,
+    n_movers:       int,
+    n_customers:    int,
+    output_records: list,
+) -> dict:
+    """
+    Shared response builder used by BOTH /api/mrr/analyze (raw file →
+    run_mrr_workflow → this) and /api/bridge/analyze (pre-classified bridge
+    file uploaded directly → this). Assembles exactly the shape
+    command-center.tsx expects:
+
+      bridge[str(lb)]      -> get_bridge_summary()   {waterfall, by_period, retention}
+      pivot[str(lb)].kpi_table -> get_kpi_matrix() for that lookback
+      top_movers            -> get_top_movers()   (computed at the LARGEST lookback,
+                               matching the frontend's default selLb = last lookback)
+      top_customers         -> get_top_customers() (same lookback choice)
+      kpi_matrix            -> flat get_kpi_matrix() at the same lookback, for the
+                               fallback path command-center.tsx uses when
+                               results.pivot is absent
+      metadata              -> {dimensions, row_count}
+      output                -> raw bridge rows (pre-load_bridge_file, engine's own
+                               column names) — this is what the frontend's
+                               effectiveByPeriod PATH A / CSV export consume
+      qc                    -> compute_bridge_qc()
+    """
+    if loaded_df is None or loaded_df.empty:
+        return {
+            "bridge": {}, "pivot": {}, "top_movers": {}, "top_customers": [],
+            "kpi_matrix": [], "metadata": {"dimensions": dimension_cols, "row_count": 0},
+            "output": output_records, "qc": {"qc1": False, "qc1_detail": "No bridge rows produced"},
+        }
+
+    bridge_dict = {}
+    pivot_dict  = {}
+    for lb in lookbacks:
+        bridge_dict[str(lb)] = get_bridge_summary(
+            loaded_df, dimension_cols=dimension_cols, lookback=lb,
+            year_filter=year_filter, period_type=period_type,
+        )
+        pivot_dict[str(lb)] = {
+            "kpi_table": get_kpi_matrix(
+                loaded_df, customer_col=customer_col, dimension_cols=dimension_cols,
+                lookback=lb, period_type=period_type,
+            )
+        }
+
+    # Top Movers / Top Customers / flat KPI matrix are computed at the
+    # LARGEST requested lookback — this matches command-center.tsx's own
+    # default (`setSelLb(lookbacks[lookbacks.length-1])` after a run), so the
+    # numbers shown by default correspond to the same lookback the UI selects.
+    primary_lb = max(lookbacks) if lookbacks else 12
+
+    movers = get_top_movers(
+        loaded_df, customer_col=customer_col, dimension_cols=dimension_cols,
+        lookback=primary_lb, n=n_movers, period_type=period_type, year_filter=year_filter,
+    )
+    top_customers = get_top_customers(
+        loaded_df, customer_col=customer_col, dimension_cols=dimension_cols,
+        lookback=primary_lb, n=n_customers, period_type=period_type, year_filter=year_filter,
+    )
+    kpi_matrix_flat = get_kpi_matrix(
+        loaded_df, customer_col=customer_col, dimension_cols=dimension_cols,
+        lookback=primary_lb, period_type=period_type,
+    )
+
+    return {
+        "bridge":        bridge_dict,
+        "pivot":         pivot_dict,
+        "top_movers":    movers,
+        "top_customers": top_customers,
+        "kpi_matrix":    kpi_matrix_flat,
+        "metadata":      {"dimensions": dimension_cols, "row_count": len(loaded_df)},
+        "output":        output_records,
+        "qc":            compute_bridge_qc(loaded_df),
+    }
+
+
 @app.post("/api/mrr/analyze")
 async def analyze_mrr(
-    file:          UploadFile    = File(...),
-    customer_col:  str           = Form("Customer"),
-    date_col:      str           = Form("Date"),
-    revenue_col:   str           = Form("MRR"),
-    product_col:   Optional[str] = Form(None),
-    channel_col:   Optional[str] = Form(None),
-    region_col:    Optional[str] = Form(None),
-    quantity_col:  Optional[str] = Form(None),
-    lookback:      int           = Form(3),
-    revenue_unit:  str           = Form("raw"),
-    tool_type:     str           = Form("MRR"),
+    file:           UploadFile    = File(...),
+    customer_col:   str           = Form("Customer"),
+    date_col:       str           = Form("Date"),
+    revenue_col:    str           = Form("MRR"),
+    product_col:    Optional[str] = Form(None),
+    channel_col:    Optional[str] = Form(None),
+    region_col:     Optional[str] = Form(None),
+    quantity_col:   Optional[str] = Form(None),
+    lookbacks:      str           = Form("[1,3,12]"),
+    revenue_unit:   str           = Form("raw"),
+    revenue_type:   str           = Form("ARR"),   # client-side ARR/MRR ×12 toggle only — not used server-side
+    dimension_cols: str           = Form("[]"),
+    year_filter:    str           = Form(""),
+    period_type:    str           = Form("Annual"),
+    n_movers:       int           = Form(30),
+    n_customers:    int           = Form(10),
+    tool_type:      str           = Form("MRR"),
 ):
     try:
         df = read_upload(file)
-        logger.info(f"/api/mrr/analyze rows={len(df)} cols={list(df.columns)[:6]}")
+        lb_list = json.loads(lookbacks) if isinstance(lookbacks, str) else lookbacks
+        logger.info(f"/api/mrr/analyze rows={len(df)} cols={list(df.columns)[:6]} lookbacks={lb_list}")
 
-        result = run_mrr_workflow(
+        has_product = bool(product_col and product_col in df.columns)
+        has_channel = bool(channel_col and channel_col in df.columns)
+        has_region  = bool(region_col  and region_col  in df.columns)
+
+        bridge_engine_df = run_mrr_workflow(
             df,
             customer_col  = customer_col,
             date_col      = date_col,
             revenue_col   = revenue_col,
-            product_col   = product_col   if product_col  and product_col  in df.columns else None,
-            channel_col   = channel_col   if channel_col  and channel_col  in df.columns else None,
-            region_col    = region_col    if region_col   and region_col   in df.columns else None,
-            quantity_col  = quantity_col  if quantity_col and quantity_col in df.columns else None,
-            lookback_months = [lookback],
+            product_col   = product_col if has_product else None,
+            channel_col   = channel_col if has_channel else None,
+            region_col    = region_col  if has_region  else None,
+            quantity_col  = quantity_col if quantity_col and quantity_col in df.columns else None,
+            lookback_months = lb_list,
             revenue_unit  = revenue_unit,
         )
 
-        return JSONResponse(content={
-            "bridge":   df_to_records(result.get("bridge",   pd.DataFrame())),
-            "bookings": df_to_records(result.get("bookings", pd.DataFrame())),
-            "qc":       result.get("qc", {}),
-            "row_count": len(df),
-        })
+        if bridge_engine_df is None or bridge_engine_df.empty:
+            return JSONResponse(content={
+                "bridge": {}, "pivot": {}, "top_movers": {}, "top_customers": [],
+                "kpi_matrix": [], "metadata": {"dimensions": [], "row_count": 0},
+                "output": [],
+                "qc": {"qc1": False, "qc1_detail": "No bridge rows produced — check column mapping"},
+                "row_count": len(df),
+            })
+
+        # IMPORTANT: run_mrr_workflow's own output ALWAYS uses the fixed
+        # column names 'Product' / 'Channel' / 'Region' (Step 1 always
+        # normalizes into these, regardless of what the raw file's original
+        # header was called). The frontend, however, sends dimension_cols as
+        # the ORIGINAL raw header names (e.g. fieldMap.product might be
+        # "Product Name" or "SKU"). Passing that raw header straight through
+        # would silently fail to match any column in the bridge output and
+        # dimension slicing would do nothing. Resolve dimension_cols by TYPE
+        # instead, using the bridge's actual fixed column names.
+        dims_resolved = []
+        if has_product: dims_resolved.append('Product')
+        if has_channel: dims_resolved.append('Channel')
+        if has_region:  dims_resolved.append('Region')
+
+        # Raw engine output — exact columns the frontend's effectiveByPeriod
+        # PATH A / CSV export expect (Date, Bridge Classification, Bridge
+        # Value, Month Lookback, etc.) — kept BEFORE load_bridge_file's
+        # internal renaming.
+        output_records = df_to_records(bridge_engine_df)
+
+        # revenue_unit='raw' here is deliberate: run_mrr_workflow already
+        # applied the user's chosen revenue_unit conversion in Step 1.
+        # load_bridge_file() defaults to 'thousands' and would silently
+        # divide every value by 1000 again if not overridden explicitly.
+        loaded = load_bridge_file(bridge_engine_df, tool_type=tool_type, revenue_unit='raw')
+
+        response = build_bridge_response(
+            loaded,
+            customer_col   = 'Customer_ID',
+            dimension_cols = dims_resolved,
+            lookbacks      = lb_list,
+            year_filter    = year_filter or None,
+            period_type    = period_type,
+            n_movers       = n_movers,
+            n_customers    = n_customers,
+            output_records = output_records,
+        )
+        response["row_count"] = len(df)
+        return JSONResponse(content=response)
     except Exception as e:
         logger.error(f"/api/mrr/analyze error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/bridge/analyze")
+async def analyze_bridge_output(
+    file:           UploadFile    = File(...),
+    tool_type:      str           = Form("MRR"),
+    customer_col:   str           = Form("Customer_ID"),
+    revenue_unit:   str           = Form("raw"),
+    lookbacks:      str           = Form("[1,3,12]"),
+    dimension_cols: str           = Form("[]"),
+    year_filter:    str           = Form(""),
+    period_type:    str           = Form("Annual"),
+    n_movers:       int           = Form(30),
+    n_customers:    int           = Form(10),
+    modules:        str           = Form("[]"),   # accepted for forward-compat; all modules always computed
+):
+    """
+    Handles the case where the uploaded file is ALREADY a pre-classified
+    bridge output (has its own Bridge Classification / Bridge Value columns
+    from a prior Alteryx or engine run), rather than raw transactional data.
+    Frontend routes here when isBridgeOutput=true. This endpoint previously
+    did not exist at all — any request to it 404'd silently into the
+    frontend's generic "Analysis failed" catch block.
+    """
+    try:
+        df = read_upload(file)
+        lb_list = json.loads(lookbacks) if isinstance(lookbacks, str) else lookbacks
+        dims    = json.loads(dimension_cols) if isinstance(dimension_cols, str) else dimension_cols
+        logger.info(f"/api/bridge/analyze rows={len(df)} cols={list(df.columns)[:8]} lookbacks={lb_list}")
+
+        output_records = df_to_records(df)
+
+        loaded = load_bridge_file(df, tool_type=tool_type, revenue_unit=revenue_unit)
+        if loaded is None or loaded.empty:
+            return JSONResponse(content={
+                "bridge": {}, "pivot": {}, "top_movers": {}, "top_customers": [],
+                "kpi_matrix": [], "metadata": {"dimensions": dims, "row_count": 0},
+                "output": output_records,
+                "qc": {"qc1": False, "qc1_detail": "Could not parse bridge columns from this file"},
+            })
+
+        response = build_bridge_response(
+            loaded,
+            customer_col   = customer_col,
+            dimension_cols = dims,
+            lookbacks      = lb_list,
+            year_filter    = year_filter or None,
+            period_type    = period_type,
+            n_movers       = n_movers,
+            n_customers    = n_customers,
+            output_records = output_records,
+        )
+        return JSONResponse(content=response)
+    except Exception as e:
+        logger.error(f"/api/bridge/analyze error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

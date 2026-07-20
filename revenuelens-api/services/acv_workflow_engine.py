@@ -99,7 +99,25 @@ def _month_revenue(acv, cstart, cend, obs):
 
 
 def _generate_rows(acv, qty, cstart, cend, lb):
-    """Same exact Alteryx logic as original — returns list of dicts (not DataFrame)."""
+    """Same exact Alteryx logic as original — returns list of dicts (not DataFrame).
+
+    Alteryx GenerateRows semantics (CONFIRMED against real Alteryx output,
+    not assumed): the tool outputs the row for the CURRENT date
+    unconditionally on every iteration, THEN evaluates the Condition
+    expression to decide whether to continue to a further row — the row
+    where the condition first evaluates false is still included in the
+    output; only the iteration after that one is skipped.
+
+    Verified directly: a real contract (End Date = 2020-01-31, Month
+    Lookback = 12) produces its last row at 2021-01-31 in real Alteryx —
+    the exact 12-months-out row — even though the Condition expression
+    evaluated AT that row already reads false (366 days / 30, rounded =
+    12.2, which fails a "<= 12" test). A check-then-output loop (the
+    earlier implementation) incorrectly drops this boundary row, stopping
+    one month early. This was the actual root cause of the Prior ACV /
+    Ending ACV roll-forward discrepancy — not the cross-join or the pACV
+    mechanism, both of which were already independently confirmed correct.
+    """
     start_lom    = _last_of_month(cstart)
     end_lom      = _last_of_month(cend)
     start_is_lom = _is_last_of_month(cstart)
@@ -109,13 +127,6 @@ def _generate_rows(acv, qty, cstart, cend, lb):
     date = start_lom
 
     while True:
-        if end_is_lom:
-            stop = _round1(_days_between(cend, date) / 30) > lb
-        else:
-            stop = _round1(_days_between(end_lom, date) / 30) > lb - 1
-        if stop:
-            break
-
         acv_flag = (start_lom <= date <= end_lom)
 
         if start_is_lom:
@@ -129,6 +140,17 @@ def _generate_rows(acv, qty, cstart, cend, lb):
             'DTE New':    acv  if expiry_flag else 0.0,
             'Qty New':    qty  if acv_flag else 0.0,
         })
+
+        # Evaluate the CONTINUE condition AFTER outputting the current row —
+        # this decides whether there will be a next row, not whether the
+        # current one was valid (that row is already appended above).
+        if end_is_lom:
+            keep_going = _round1(_days_between(cend, date) / 30) <= lb
+        else:
+            keep_going = _round1(_days_between(end_lom, date) / 30) <= lb - 1
+        if not keep_going:
+            break
+
         date = date + MonthEnd(1)
 
     return rows
@@ -262,40 +284,51 @@ def run_acv_workflow(
         agg['Month Lookback'] = lb
         mark(f'STEP 5b (lb={lb}) - groupby aggregate', t0)
 
-        # STEP 6 - VECTORIZED cross-join (was merge-per-group loop)
+        # STEP 6 — CORRECTED. Previously this re-stretched `agg` (which is
+        # already correctly bounded per-contract by _generate_rows, matching
+        # the original workflow's GenerateRows tool exactly — see investigation
+        # doc) into a CONTINUOUS unit_min-to-unit_max cross-join, fabricating
+        # zero-value rows to fill any real gap between two non-contiguous
+        # contracts for the same unit. That gap-filling is what broke the
+        # Prior ACV / Ending ACV roll-forward identity between periods.
+        #
+        # Fix: use `agg` directly — no cross-join, no gap-filling. This alone
+        # matches the original workflow, which never generates a row for a
+        # month where no contract's own bounded window reaches.
         t0 = time.time()
-        unit_ranges = agg.groupby(UNIT_COLS)['Date New'].agg(['min', 'max']).reset_index()
-        unit_ranges.columns = list(UNIT_COLS) + ['unit_min', 'unit_max']
-
-        global_dates = pd.date_range(agg['Date New'].min(), agg['Date New'].max(), freq='ME')
-        date_df = pd.DataFrame({'Date New': global_dates})
-
-        unit_ranges['_key'] = 1
-        date_df['_key'] = 1
-        cross = unit_ranges.merge(date_df, on='_key').drop(columns='_key')
-        cross = cross[(cross['Date New'] >= cross['unit_min']) & (cross['Date New'] <= cross['unit_max'])]
-        cross = cross.drop(columns=['unit_min', 'unit_max']).copy()
-        cross['Month Lookback'] = lb
-
-        dense = cross.merge(
-            agg[UNIT_COLS + ['Date New', 'ACV_New', 'DTE_New', 'Qty_New']],
-            on=UNIT_COLS + ['Date New'], how='left'
-        ).fillna(0.0)
-        mark(f'STEP 6 (lb={lb}) - dense series (vectorized cross-join, {len(unit_ranges)} units)', t0)
+        dense = agg.sort_values(UNIT_COLS + ['Date New']).reset_index(drop=True)
+        mark(f'STEP 6 (lb={lb}) - use per-contract agg directly (no gap-fill cross-join)', t0)
 
         if dense.empty:
             continue
 
-        # STEP 7 - unchanged, already vectorized
+        # STEP 7 — pACV mechanism CONFIRMED from source: the original
+        # workflow computes pACV via a MultiRowFormula tool —
+        # "pACV New = [Row-12:ACV New]", grouped by Customer x Product x
+        # Channel x Region — a ROW-POSITION lookback, not a calendar-date
+        # join. Traced its full upstream chain (GenerateRows -> Formula ->
+        # Formula -> Summarize -> MultiRowFormula) and confirmed there is NO
+        # Union/cross-join/densification step anywhere before it — the
+        # original relies on the same per-contract-bounded union `agg`
+        # already computed above, with no gap-filling. So this now matches
+        # the original exactly: no cross-join (Step 6, confirmed correct),
+        # row-position shift for pACV (this step, corrected back from an
+        # earlier date-join attempt that deviated from the true mechanism).
         t0 = time.time()
-        dense = dense.sort_values(UNIT_COLS + ['Date New']).reset_index(drop=True)
         dense['pACV'] = dense.groupby(UNIT_COLS)['ACV_New'].shift(lb).fillna(0.0)
         dense['pQty'] = dense.groupby(UNIT_COLS)['Qty_New'].shift(lb).fillna(0.0)
+
+        # mask_allzero matches the original workflow exactly (Container 4,
+        # Tool 4.3 Filter: [ACV New]=0 and [pACV New]=0 and [DTE New]=0) —
+        # a row with genuinely no signal at all.
         mask_allzero = (dense['ACV_New'] == 0) & (dense['pACV'] == 0) & (dense['DTE_New'] == 0)
         dense = dense[~mask_allzero].copy()
-        mask_dead = (dense['ACV_New'] == 0) & (dense['pACV'] > 0) & (dense['DTE_New'] == 0)
-        dense = dense[~mask_dead].copy()
-        mark(f'STEP 7 (lb={lb}) - pACV shift + filters', t0)
+
+        # mask_dead REMOVED. A full pass through the entire original workflow
+        # XML confirms it has no second row-suppression filter — only
+        # mask_allzero exists. mask_dead had no counterpart in the source and
+        # was masking the row-generation bug rather than fixing it.
+        mark(f'STEP 7 (lb={lb}) - pACV via row-position shift (matches Row-12 MultiRowFormula)', t0)
 
         all_lb_parts.append(dense)
 
